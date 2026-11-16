@@ -161,7 +161,10 @@
       // deux journées (heures) et effectif minimum par entrepôt ({ entrepotId: nombre }).
       maxJoursConsecutifs: 6,
       reposMinHeures: 11,
-      effectifMinimum: {}
+      effectifMinimum: {},
+      // Droits annuels de congés par défaut (jours), modifiables livreur par livreur.
+      droitCPDefaut: 30,
+      droitRTTDefaut: 0
     }
   };
 
@@ -539,6 +542,8 @@
     if (pr.maxJoursConsecutifs === undefined) pr.maxJoursConsecutifs = DEFAULT_DATA.planningReglages.maxJoursConsecutifs;
     if (pr.reposMinHeures === undefined) pr.reposMinHeures = DEFAULT_DATA.planningReglages.reposMinHeures;
     if (!pr.effectifMinimum) pr.effectifMinimum = {};
+    if (pr.droitCPDefaut === undefined) pr.droitCPDefaut = DEFAULT_DATA.planningReglages.droitCPDefaut;
+    if (pr.droitRTTDefaut === undefined) pr.droitRTTDefaut = DEFAULT_DATA.planningReglages.droitRTTDefaut;
     return pr;
   }
 
@@ -764,6 +769,55 @@
   // être rattaché à plusieurs entrepôts).
   function livreurAEntrepot(l, entrepotId) {
     return !!l && Array.isArray(l.entrepotIds) && l.entrepotIds.indexOf(entrepotId) !== -1;
+  }
+
+  // Soldes de congés (année civile) : droit annuel (par livreur, sinon valeur par défaut des
+  // réglages du planning ; proratisé l'année d'embauche) moins les jours « CP » / « RTT » posés
+  // dans le planning. Un droit à 0 signifie « pas de suivi » pour ce type.
+  function droitConges(l, type, year) {
+    var r = getPlanningReglages();
+    var key = type === "cp" ? "droitCP" : "droitRTT";
+    var def = type === "cp" ? r.droitCPDefaut : r.droitRTTDefaut;
+    var raw = l ? l[key] : undefined;
+    var v = (raw !== undefined && raw !== null && raw !== "") ? Number(raw) : Number(def);
+    if (!isFinite(v) || v <= 0) return 0;
+    var he = l && l.dateEmbauche ? l.dateEmbauche : "";
+    if (he && he.slice(0, 4) > String(year)) return 0;
+    if (he && he.slice(0, 4) === String(year)) {
+      var total = daysBetweenIso(year + "-01-01", year + "-12-31") + 1;
+      var left = daysBetweenIso(he, year + "-12-31") + 1;
+      v = Math.round(v * left / total * 2) / 2;
+    }
+    return v;
+  }
+
+  function soldeConges(l, year) {
+    year = year || new Date().getFullYear();
+    var from = year + "-01-01", to = year + "-12-31", today = todayISO();
+    var res = { year: year, cp: { droit: droitConges(l, "cp", year), pris: 0, avenir: 0 }, rtt: { droit: droitConges(l, "rtt", year), pris: 0, avenir: 0 } };
+    list("planningEntrees").forEach(function (e) {
+      if (e.livreurId !== l.id || e.date < from || e.date > to) return;
+      if (e.type === "cp" || e.type === "rtt") { res[e.type].pris++; if (e.date > today) res[e.type].avenir++; }
+    });
+    ["cp", "rtt"].forEach(function (t) {
+      res[t].restant = res[t].droit - res[t].pris;
+      res[t].suivi = res[t].droit > 0;
+      res[t].depasse = res[t].droit > 0 && res[t].restant < 0;
+    });
+    return res;
+  }
+
+  // Livreurs actifs ayant posé plus de CP / RTT que leur droit.
+  function congesDepasses(year) {
+    var out = [];
+    list("livreurs").forEach(function (l) {
+      if (l.statut === "inactif") return;
+      var sc = soldeConges(l, year);
+      ["cp", "rtt"].forEach(function (t) {
+        if (sc[t].depasse) out.push({ livreur: l, type: t, droit: sc[t].droit, pris: sc[t].pris, exces: -sc[t].restant });
+      });
+    });
+    return out;
   }
 
   // Écart en jours entre deux dates iso (b - a).
@@ -1305,6 +1359,8 @@
     livreurAEntrepot: livreurAEntrepot,
     livreurEmbaucheLe: livreurEmbaucheLe,
     daysBetweenIso: daysBetweenIso,
+    soldeConges: soldeConges,
+    congesDepasses: congesDepasses,
     livreurEcheances: livreurEcheances,
     toutesEcheancesLivreurs: toutesEcheancesLivreurs,
     vehiculeEntretienKm: vehiculeEntretienKm,
@@ -2409,9 +2465,128 @@
     return { sheetName: sheetInfo.name, rows: rows };
   }
 
+  // ------------------------------------------------------------------
+  // Écriture d'un classeur .xlsx (sans compression : archive ZIP "stockée"). Chaque feuille :
+  // { name, rows: [[...]], widths: [..] } ; la première ligne est l'en-tête (gras, figée,
+  // avec filtre). Les nombres restent numériques ; une chaîne "AAAA-MM-JJ" devient une vraie date.
+  // ------------------------------------------------------------------
+  var CRC_TABLE = null;
+  function crc32(bytes) {
+    if (!CRC_TABLE) {
+      CRC_TABLE = [];
+      for (var n = 0; n < 256; n++) { var c = n; for (var k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); CRC_TABLE[n] = c >>> 0; }
+    }
+    var crc = 0xFFFFFFFF;
+    for (var i = 0; i < bytes.length; i++) crc = CRC_TABLE[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
+    return (crc ^ 0xFFFFFFFF) >>> 0;
+  }
+  function utf8Bytes(str) {
+    if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(str);
+    var u = unescape(encodeURIComponent(str)), out = new Uint8Array(u.length);
+    for (var i = 0; i < u.length; i++) out[i] = u.charCodeAt(i);
+    return out;
+  }
+  function zipStore(files) {
+    var chunks = [], central = [], offset = 0;
+    function u16(v) { return [v & 0xFF, (v >>> 8) & 0xFF]; }
+    function u32(v) { return [v & 0xFF, (v >>> 8) & 0xFF, (v >>> 16) & 0xFF, (v >>> 24) & 0xFF]; }
+    files.forEach(function (f) {
+      var name = utf8Bytes(f.name), data = f.data, crc = crc32(data);
+      var local = [].concat(u32(0x04034b50), u16(20), u16(0x0800), u16(0), u16(0), u16(0x21), u32(crc), u32(data.length), u32(data.length), u16(name.length), u16(0));
+      chunks.push(new Uint8Array(local), name, data);
+      central.push({ name: name, crc: crc, size: data.length, offset: offset });
+      offset += local.length + name.length + data.length;
+    });
+    var cdStart = offset, cdSize = 0;
+    central.forEach(function (c) {
+      var rec = [].concat(u32(0x02014b50), u16(20), u16(20), u16(0x0800), u16(0), u16(0), u16(0x21), u32(c.crc), u32(c.size), u32(c.size), u16(c.name.length), u16(0), u16(0), u16(0), u16(0), u32(0), u32(c.offset));
+      chunks.push(new Uint8Array(rec), c.name);
+      cdSize += rec.length + c.name.length;
+    });
+    chunks.push(new Uint8Array([].concat(u32(0x06054b50), u16(0), u16(0), u16(central.length), u16(central.length), u32(cdSize), u32(cdStart), u16(0))));
+    var total = 0; chunks.forEach(function (c) { total += c.length; });
+    var out = new Uint8Array(total), pos = 0;
+    chunks.forEach(function (c) { out.set(c, pos); pos += c.length; });
+    return out;
+  }
+  function xmlEsc(v) {
+    return String(v).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+  function colLetter(i) { var s = ""; i++; while (i > 0) { var m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = Math.floor((i - 1) / 26); } return s; }
+  function isoToSerial(iso) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
+    if (!m) return null;
+    return Math.round((Date.UTC(+m[1], +m[2] - 1, +m[3]) - Date.UTC(1899, 11, 30)) / 86400000);
+  }
+  function sheetXml(sheet) {
+    var rows = sheet.rows || [], ncols = 0;
+    rows.forEach(function (r) { if (r.length > ncols) ncols = r.length; });
+    var x = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+      '<sheetViews><sheetView workbookViewId="0">' + (rows.length > 1 ? '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>' : '') + '</sheetView></sheetViews>';
+    if (sheet.widths && sheet.widths.length) {
+      x += '<cols>' + sheet.widths.map(function (w, i) { return '<col min="' + (i + 1) + '" max="' + (i + 1) + '" width="' + w + '" customWidth="1"/>'; }).join("") + '</cols>';
+    }
+    x += '<sheetData>';
+    rows.forEach(function (r, ri) {
+      x += '<row r="' + (ri + 1) + '">';
+      r.forEach(function (v, ci) {
+        if (v === null || v === undefined || v === "") return;
+        var ref = colLetter(ci) + (ri + 1);
+        if (ri === 0) { x += '<c r="' + ref + '" t="inlineStr" s="1"><is><t>' + xmlEsc(v) + '</t></is></c>'; return; }
+        if (typeof v === "number" && isFinite(v)) { x += '<c r="' + ref + '"><v>' + v + '</v></c>'; return; }
+        var ser = typeof v === "string" ? isoToSerial(v) : null;
+        if (ser !== null) { x += '<c r="' + ref + '" s="2"><v>' + ser + '</v></c>'; return; }
+        x += '<c r="' + ref + '" t="inlineStr"><is><t xml:space="preserve">' + xmlEsc(v) + '</t></is></c>';
+      });
+      x += '</row>';
+    });
+    x += '</sheetData>';
+    if (rows.length > 1 && ncols) x += '<autoFilter ref="A1:' + colLetter(ncols - 1) + rows.length + '"/>';
+    return x + '</worksheet>';
+  }
+  function buildWorkbook(sheets) {
+    var names = sheets.map(function (sh, i) {
+      var n = String(sh.name || ("Feuille" + (i + 1))).replace(/[\[\]:*?\/\\]/g, " ").slice(0, 31).trim() || ("Feuille" + (i + 1));
+      return n;
+    });
+    var enc = function (str) { return utf8Bytes(str); };
+    var files = [];
+    files.push({ name: "[Content_Types].xml", data: enc('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' +
+      sheets.map(function (_, i) { return '<Override PartName="/xl/worksheets/sheet' + (i + 1) + '.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'; }).join("") + '</Types>') });
+    files.push({ name: "_rels/.rels", data: enc('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>') });
+    files.push({ name: "xl/workbook.xml", data: enc('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>' +
+      names.map(function (n, i) { return '<sheet name="' + xmlEsc(n) + '" sheetId="' + (i + 1) + '" r:id="rId' + (i + 1) + '"/>'; }).join("") + '</sheets></workbook>') });
+    files.push({ name: "xl/_rels/workbook.xml.rels", data: enc('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+      sheets.map(function (_, i) { return '<Relationship Id="rId' + (i + 1) + '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet' + (i + 1) + '.xml"/>'; }).join("") +
+      '<Relationship Id="rId' + (sheets.length + 1) + '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>') });
+    files.push({ name: "xl/styles.xml", data: enc('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+      '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts>' +
+      '<fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFE8ECF8"/><bgColor indexed="64"/></patternFill></fill></fills>' +
+      '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>' +
+      '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>' +
+      '<cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/><xf numFmtId="14" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs>' +
+      '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>' +
+      '</styleSheet>') });
+    sheets.forEach(function (sh, i) { files.push({ name: "xl/worksheets/sheet" + (i + 1) + ".xml", data: enc(sheetXml(sh)) }); });
+    return zipStore(files);
+  }
+  // Construit le classeur et le télécharge. Retourne le nombre d'octets.
+  function downloadWorkbook(filename, sheets) {
+    var bytes = buildWorkbook(sheets);
+    var blob = new Blob([bytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(a.href); }, 1500);
+    return bytes.length;
+  }
+
   global.XLSXLite = {
     parseWorkbook: parseWorkbook,
     excelSerialToDate: excelSerialToDate,
+    buildWorkbook: buildWorkbook,
+    downloadWorkbook: downloadWorkbook,
     _internal: { inflateRaw: inflateRaw, parseZip: parseZip }
   };
 })(typeof window !== "undefined" ? window : globalThis);
@@ -2787,6 +2962,38 @@
     document.getElementById("btnAutoFile").addEventListener("click", function () {
       if (AutoFile.linked()) openLinkedModal(); else openLinkModal();
     });
+    if (installPrompt) {
+      var ib = document.createElement("button");
+      ib.className = "btn btn-ghost btn-sm"; ib.id = "btnInstallApp"; ib.style.color = "#b7bede";
+      ib.title = "Installer LivraisonManager comme une application (fonctionne aussi hors ligne)";
+      ib.innerHTML = global.LM.icon("download") + " Installer l'application";
+      ib.addEventListener("click", function () {
+        var ev = installPrompt; installPrompt = null;
+        ev.prompt();
+        if (ev.userChoice) ev.userChoice.then(function () { renderTools(); });
+      });
+      el.appendChild(ib);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Application installable (PWA) : service worker pour le mode hors ligne + bouton d'installation
+  // quand le navigateur le propose. Sans effet en ouverture directe du fichier (file://).
+  // ------------------------------------------------------------------
+  var installPrompt = null;
+  if (typeof window !== "undefined") {
+    window.addEventListener("beforeinstallprompt", function (e) {
+      e.preventDefault();
+      installPrompt = e;
+      try { renderTools(); } catch (err) { /* menu pas encore affiché : il lira installPrompt à l'ouverture */ }
+    });
+    window.addEventListener("appinstalled", function () {
+      installPrompt = null;
+      try { renderTools(); global.LM.toast("Application installée.", "success"); } catch (err) { /* ignore */ }
+    });
+    if ("serviceWorker" in navigator && /^https?:$/.test(location.protocol)) {
+      window.addEventListener("load", function () { navigator.serviceWorker.register("sw.js").catch(function () { /* hors ligne ou fichier absent : sans conséquence */ }); });
+    }
   }
 
   function openLinkedModal() {
@@ -3010,6 +3217,9 @@
     var echu = ech.filter(function (e) { return e.etat === "expire"; }).length;
     if (echu) add("danger", echu + " document(s) / contrat(s) de livreur échu(s)", "#/livreurs");
     if (ech.length - echu) add("warning", (ech.length - echu) + " échéance(s) de livreur dans les 30 jours (permis, visite médicale, contrat)", "#/livreurs");
+
+    var cg = DB.congesDepasses();
+    if (cg.length) add("warning", cg.length + " dépassement(s) de solde de congés (CP / RTT)", "#/livreurs");
 
     var tickets = DB.list("ticketsReparation").filter(function (t) { return t.statut === "nouveau" || t.statut === "en_cours"; });
     var late = tickets.filter(function (t) { return t.dateEcheance && t.dateEcheance < today; }).length;
@@ -3347,11 +3557,36 @@
   // Badges d'échéances administratives (permis, visite médicale, fin de contrat) d'un livreur.
   function echeanceBadges(l) {
     var ech = DB.livreurEcheances(l, 30);
-    if (!ech.length) return "";
+    var sc = DB.soldeConges(l);
+    var extra = "";
+    ["cp", "rtt"].forEach(function (t) {
+      if (sc[t].depasse) extra += '<span class="badge badge-danger" title="' + sc[t].pris + ' jour(s) posé(s) pour un droit de ' + sc[t].droit + '">' + t.toUpperCase() + ' dépassé de ' + (-sc[t].restant) + ' j</span>';
+    });
+    if (!ech.length && !extra) return "";
     return '<div class="ech-badges">' + ech.map(function (e) {
       return '<span class="badge ' + (e.etat === "expire" ? "badge-danger" : "badge-warning") + '" title="' + LM.escapeHtml(e.label) + ' : ' + DB.fmtDate(e.date) + '">' +
         LM.escapeHtml(e.label) + (e.etat === "expire" ? " expiré" : " dans " + e.jours + " j") + '</span>';
-    }).join("") + '</div>';
+    }).join("") + extra + '</div>';
+  }
+
+  // Tableau des soldes de congés de l'année pour tous les livreurs actifs (bloc repliable).
+  function soldesCardHtml(livreurs) {
+    var year = new Date().getFullYear();
+    var rows = livreurs.filter(function (l) { return l.statut !== "inactif"; }).map(function (l) { return { l: l, sc: DB.soldeConges(l, year) }; })
+      .filter(function (r) { return r.sc.cp.suivi || r.sc.rtt.suivi; });
+    if (!rows.length) return "";
+    var nbOver = rows.filter(function (r) { return r.sc.cp.depasse || r.sc.rtt.depasse; }).length;
+    function cell(c) {
+      if (!c.suivi) return '<span class="text-faint">—</span>';
+      return '<span class="' + (c.depasse ? "sim-down" : "") + '"><strong>' + DB.fmtNum(c.restant) + '</strong> / ' + DB.fmtNum(c.droit) + '</span>' + (c.avenir ? '<div class="text-faint text-sm">dont ' + c.avenir + ' à venir</div>' : '');
+    }
+    return '<details class="card soldes-card"><summary><strong>Soldes de congés ' + year + '</strong> <span class="text-faint text-sm">— restants / droit annuel</span>' +
+      (nbOver ? ' <span class="badge badge-danger">' + nbOver + ' dépassement' + (nbOver > 1 ? "s" : "") + '</span>' : '') + '</summary>' +
+      '<div class="table-wrap" style="margin-top:12px;"><table><thead><tr><th>Livreur</th><th class="num">CP</th><th class="num">RTT</th><th></th></tr></thead><tbody>' +
+      rows.sort(function (a, b) { return DB.livreurNomComplet(a.l).localeCompare(DB.livreurNomComplet(b.l), "fr"); }).map(function (r) {
+        return '<tr><td>' + LM.escapeHtml(DB.livreurNomComplet(r.l)) + '</td><td class="num">' + cell(r.sc.cp) + '</td><td class="num">' + cell(r.sc.rtt) + '</td>' +
+          '<td class="actions"><button class="btn btn-ghost btn-sm" data-ech-liv="' + r.l.id + '">Fiche</button></td></tr>';
+      }).join("") + '</tbody></table></div></details>';
   }
 
   function echeancesCardHtml() {
@@ -3390,6 +3625,14 @@
       stat("Retards signalés", DB.fmtNum(retards.length)) +
       stat("Jours d'absence", DB.fmtNum(absences.length)) +
     '</div>';
+
+    var sc = DB.soldeConges(l);
+    function congeStat(label, c) {
+      if (!c.suivi) return '';
+      return '<div class="lh-stat' + (c.depasse ? ' lh-stat-bad' : '') + '"><div class="lh-stat-v">' + DB.fmtNum(c.restant) + ' j</div><div class="lh-stat-l">' + label + ' restants (' + DB.fmtNum(c.pris) + ' / ' + DB.fmtNum(c.droit) + (c.avenir ? ', dont ' + c.avenir + ' à venir' : '') + ')</div></div>';
+    }
+    var congesHtml = congeStat("CP " + sc.year, sc.cp) + congeStat("RTT " + sc.year, sc.rtt);
+    if (congesHtml) html += '<h3 class="lh-title">Congés ' + sc.year + '</h3><div class="lh-stats lh-stats-2">' + congesHtml + '</div>';
 
     html += '<h3 class="lh-title">Véhicules attribués</h3>';
     html += atts.length ? '<div class="table-wrap"><table><thead><tr><th>Véhicule</th><th>Du</th><th>Au</th></tr></thead><tbody>' + atts.slice(0, 8).map(function (a) {
@@ -3433,6 +3676,7 @@
         kpi("entrepot", "Entrepôts couverts", DB.fmtNum(entrepots.length)) +
       '</div>' +
       echeancesCardHtml() +
+      soldesCardHtml(livreurs) +
       '<div class="card">' +
         '<div class="card-header"><div><h2>Équipe de livraison</h2><p>Gérez l\'affectation des livreurs aux entrepôts et véhicules.</p></div>' +
         '<button class="btn btn-primary" id="btnAdd">' + LM.icon("plus") + ' Ajouter un livreur</button></div>' +
@@ -3519,7 +3763,7 @@
 
     function openForm(existing) {
       var isEdit = !!existing;
-      var l = existing || { prenom: "", nom: "", telephone: "", email: "", entrepotIds: [], vehiculeId: "", statut: "actif", dateEmbauche: DB.todayISO(), permis: "B", zone: "", notes: "", tags: [], permisExpiration: "", visiteMedicale: "", finContrat: "" };
+      var l = existing || { prenom: "", nom: "", telephone: "", email: "", entrepotIds: [], vehiculeId: "", statut: "actif", dateEmbauche: DB.todayISO(), permis: "B", zone: "", notes: "", tags: [], droitCP: "", droitRTT: "", permisExpiration: "", visiteMedicale: "", finContrat: "" };
       var entrepots = DB.list("entrepots");
 
       // Un livreur peut être rattaché à plusieurs entrepôts : entIds est toujours un tableau
@@ -3569,6 +3813,10 @@
               field("Prochaine visite médicale", "visiteMedicale", l.visiteMedicale, "date") +
               field("Fin de contrat (CDD / intérim)", "finContrat", l.finContrat, "date") +
             '</div>' +
+            '<div class="form-row">' +
+              field("Droit annuel de CP (jours)", "droitCP", l.droitCP, "number", false, "Vide = valeur par défaut des Paramètres planning (" + DB.getPlanningReglages().droitCPDefaut + " j). Proratisé l'année d'embauche.") +
+              field("Droit annuel de RTT (jours)", "droitRTT", l.droitRTT, "number", false, "Vide = valeur par défaut (" + DB.getPlanningReglages().droitRTTDefaut + " j). 0 = pas de suivi des RTT.") +
+            '</div>' +
             field("Tags / anciens noms", "tags", Array.isArray(l.tags) ? l.tags.join(", ") : "", "text", false, "Anciens noms ou comptes recréés associés à ce livreur, séparés par des virgules. Utile si le site d'export vous oblige à recréer un compte : ajoutez l'ancien nom ici pour que les imports Excel continuent de le reconnaître.") +
             '<div class="field"><label>Notes</label><textarea name="notes">' + LM.escapeHtml(l.notes || "") + '</textarea></div>' +
           '</form>' + (isEdit ? '</div><div class="tab-panel" data-lpanel="hist">' + historiqueHtml(l) + '</div>' : ''),
@@ -3607,6 +3855,8 @@
               permisExpiration: fd.get("permisExpiration") || "",
               visiteMedicale: fd.get("visiteMedicale") || "",
               finContrat: fd.get("finContrat") || "",
+              droitCP: (fd.get("droitCP") || "").toString().trim() === "" ? "" : Math.max(0, Number(fd.get("droitCP")) || 0),
+              droitRTT: (fd.get("droitRTT") || "").toString().trim() === "" ? "" : Math.max(0, Number(fd.get("droitRTT")) || 0),
               zone: (fd.get("zone") || "").toString().trim(),
               tags: tags,
               notes: (fd.get("notes") || "").toString().trim()
@@ -3616,7 +3866,7 @@
             if (isEdit) {
               DB.syncAttribution(l.id, l.vehiculeId, payload.vehiculeId);
               DB.update("livreurs", l.id, payload);
-              var changes = DB.summarizeFieldChanges(l, payload, { telephone: "Téléphone", email: "Email", zone: "Zone", dateEmbauche: "Date d'embauche", permis: "Permis", permisExpiration: "Validité du permis", visiteMedicale: "Visite médicale", finContrat: "Fin de contrat" });
+              var changes = DB.summarizeFieldChanges(l, payload, { telephone: "Téléphone", email: "Email", zone: "Zone", dateEmbauche: "Date d'embauche", permis: "Permis", permisExpiration: "Validité du permis", visiteMedicale: "Visite médicale", finContrat: "Fin de contrat", droitCP: "Droit de CP", droitRTT: "Droit de RTT" });
               DB.logHistorique("Livreurs", "modification", "Modification livreur : " + nomComplet + (changes ? " -> " + changes : ""));
             } else {
               targetId = DB.add("livreurs", payload).id;
@@ -5777,7 +6027,7 @@
 
 
 /* ==== js/analyse.js ==== */
-/*! analyse.js - Page d'analyse des livraisons : période, KPIs, graphiques, import Excel, saisie manuelle */
+/*! analyse.js - Page d'analyse des livraisons : période, KPIs, graphiques, import Excel, saisie manuelle (pop-up) */
 (function () {
   "use strict";
 
@@ -5797,17 +6047,6 @@
   var histDateEnd = null;
   var histEntIds = null; // null = tous ; sinon tableau d'ids (ou UNASSIGNED)
   var histLivIds = null; // idem
-  // État de l'onglet Saisie manuelle : les "chips" Dates, Entrepôts et Livreurs servent de palette
-  // rapide pour générer des lignes dans la grille (produit cartésien dates × entrepôts, éventuellement
-  // × livreurs pré-sélectionnés), mais la grille elle-même (manualGridRows) est la source de vérité une
-  // fois générée — chaque ligne conserve ses propres livreur/bacs/livraisons/km/retards/commentaire,
-  // modifiable et supprimable/duplicable indépendamment, pour saisir en un seul passage plusieurs jours,
-  // plusieurs entrepôts et/ou plusieurs livreurs. Le champ "retards" (colonne "Retards" de la grille)
-  // crée, à l'enregistrement, un signalement DB.upsertRetard lié à la nouvelle entrée du journal.
-  var manualDates = [DB.todayISO()];
-  var manualEntrepots = [];
-  var manualLivreurs = []; // livreurs pré-sélectionnés (optionnel) : si vide, les lignes générées restent "Non précisé" (à choisir ligne par ligne)
-  var manualGridRows = []; // { id, date, entrepotId, livreurId, nbLivraisons, nbBacs, km, retards, commentaire }
 
   // Le fichier importé est au niveau "commande" : une ligne = une livraison (un bac/arrêt chez un client).
   // Le nombre de livraisons n'est donc jamais lu depuis une colonne : il vaut toujours 1 par ligne importée,
@@ -5910,7 +6149,6 @@
     incoherence: { label: "Incohérences", icon: "alert", color: "#7c4dd6", tint: "rgba(124, 77, 214, 0.13)" }
   };
   var CTRL_ORDER = { date: 0, entrepot: 1, livreur: 2, incoherence: 3 };
-  var manualSync = null; // recopie la grille de saisie manuelle affichée dans manualGridRows (voir renderManualTab)
 
   function ctrlAddDays(iso, n) {
     var p = iso.split("-");
@@ -6160,38 +6398,20 @@
     if (el && el.scrollIntoView) el.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
-  // Ouvre « Saisie manuelle » avec les lignes de la grille déjà préparées (date + entrepôt +
-  // livreur) pour les livreurs demandés ; l'utilisateur n'a plus qu'à renseigner les chiffres.
+  // Ouvre le pop-up « Saisie manuelle » avec la date et les livreurs (et leur entrepôt) déjà
+  // préparés ; l'utilisateur n'a plus qu'à renseigner les chiffres.
   function ctrlPrefillManual(n, livreurIds) {
-    if (manualSync && journalTab === "manuel") manualSync();
     var pairs = [], sansEntrepot = 0;
     livreurIds.forEach(function (livId) {
       var l = DB.get("livreurs", livId);
       var entId = ctrlPrimaryEntrepot(l) || (n.entrepotIds.length === 1 ? n.entrepotIds[0] : null);
-      if (!entId) { sansEntrepot++; return; }
+      if (!entId) sansEntrepot++;
       pairs.push({ entrepotId: entId, livreurId: livId });
     });
-    var untouched = !manualGridRows.length && !manualEntrepots.length && manualDates.length === 1 && manualDates[0] === DB.todayISO();
-    if (untouched) manualDates = [];
-    if (manualDates.indexOf(n.date) === -1) { manualDates.push(n.date); manualDates.sort(); }
-    var added = 0;
-    pairs.forEach(function (p) {
-      if (manualEntrepots.indexOf(p.entrepotId) === -1) manualEntrepots.push(p.entrepotId);
-      var exists = manualGridRows.some(function (r) { return r.date === n.date && r.entrepotId === p.entrepotId && r.livreurId === p.livreurId; });
-      if (!exists) {
-        manualGridRows.push({ id: DB.uid("mgr"), date: n.date, entrepotId: p.entrepotId, livreurId: p.livreurId, nbLivraisons: "", nbBacs: "", km: "", retards: "", commentaire: "" });
-        added++;
-      }
-    });
-    journalTab = "manuel";
-    journalPage = 1;
-    selectedIds = {};
+    saisiePrefill(n.date, pairs);
     LM.closeModal();
-    render(document.getElementById("content"));
-    ctrlScrollToJournal();
-    var msg = added ? added + " ligne" + (added > 1 ? "s" : "") + " préparée" + (added > 1 ? "s" : "") + " dans la saisie manuelle : renseignez les livraisons puis enregistrez." : "Ces lignes sont déjà présentes dans la grille de saisie manuelle.";
-    if (sansEntrepot) msg += " " + sansEntrepot + " livreur(s) sans entrepôt rattaché : ajoutez l'entrepôt à la main.";
-    LM.toast(msg, added ? "success" : "danger");
+    openSaisieModal();
+    if (sansEntrepot) LM.toast(sansEntrepot + " livreur(s) sans entrepôt rattaché : ajoutez l'entrepôt à la main.", "danger");
   }
 
   // Affiche dans « Historique & imports » les entrées du jour pour le livreur concerné.
@@ -6288,7 +6508,8 @@
     content.innerHTML =
       '<div class="card">' +
         '<div class="card-header"><div><h2>Période d\'analyse</h2><p>Choisissez une période pour filtrer les statistiques ci-dessous.</p></div>' +
-          '<button class="btn btn-pdf" id="btnExportAnalysePdf">' + LM.icon("file") + ' Exporter en PDF</button>' +
+          '<div class="flex gap-8"><button class="btn btn-primary" id="btnSaisie">' + LM.icon("plus") + ' Saisie manuelle</button><button class="btn btn-secondary" id="btnExportAnalyseXlsx">' + LM.icon("download") + ' Exporter en Excel</button>' +
+          '<button class="btn btn-pdf" id="btnExportAnalysePdf">' + LM.icon("file") + ' Exporter en PDF</button></div>' +
         '</div>' +
         '<div class="flex gap-8" style="flex-wrap:wrap;margin-bottom:14px;" id="presetRow"></div>' +
         '<div class="form-row" id="customRow" style="' + (period.preset === "custom" ? "" : "display:none;") + '">' +
@@ -6309,10 +6530,10 @@
       '<div class="card" id="rankingsCard"></div>' +
       '<div class="card" id="controlCard"></div>' +
       '<div class="card" id="journalCard">' +
-        '<div class="card-header"><div><h2>Journal des livraisons</h2><p>Importez un fichier Excel, saisissez des entrées manuelles ou consultez l\'historique.</p></div></div>' +
+        '<div class="card-header"><div><h2>Journal des livraisons</h2><p>Importez un fichier Excel, saisissez des entrées manuelles ou consultez l\'historique.</p></div>' +
+          '<button class="btn btn-primary" id="btnSaisieJournal">' + LM.icon("plus") + ' Saisie manuelle</button></div>' +
         '<div class="tabs">' +
           '<button class="tab-btn' + (journalTab === "import" ? " active" : "") + '" data-tab="import">Import Excel</button>' +
-          '<button class="tab-btn' + (journalTab === "manuel" ? " active" : "") + '" data-tab="manuel">Saisie manuelle</button>' +
           '<button class="tab-btn' + (journalTab === "historique" ? " active" : "") + '" data-tab="historique">Historique &amp; imports</button>' +
         '</div>' +
         '<div id="journalPanel"></div>' +
@@ -6326,6 +6547,9 @@
     renderJournalTab();
 
     document.getElementById("btnExportAnalysePdf").addEventListener("click", openExportAnalysePdfModal);
+    document.getElementById("btnSaisie").addEventListener("click", openSaisieModal);
+    document.getElementById("btnSaisieJournal").addEventListener("click", openSaisieModal);
+    document.getElementById("btnExportAnalyseXlsx").addEventListener("click", exportAnalyseXlsx);
 
     content.querySelectorAll("[data-tab]").forEach(function (btn) {
       btn.addEventListener("click", function () {
@@ -6476,6 +6700,38 @@
       series: [{ name: "Livraisons", data: livList.map(function (l) { return l.liv; }) }],
       height: 260
     });
+  }
+
+  // Export Excel de la période : journal détaillé + synthèses par entrepôt et par livreur.
+  function exportAnalyseXlsx() {
+    var rows = livraisonsInRange(period.start, period.end).slice().sort(function (a, b) { return a.date.localeCompare(b.date); });
+    if (!rows.length) { LM.toast("Aucune livraison sur cette période à exporter.", "danger"); return; }
+    var journal = [["Date", "Entrepôt", "Livreur", "Livraisons", "Bacs", "Km", "Retards signalés", "Incidents", "Client", "Adresse", "Code postal", "Ville", "Tournée", "Séquence", "Source", "Commentaire"]];
+    var byEnt = {}, byLiv = {};
+    rows.forEach(function (r) {
+      var ret = sumRetard([r]);
+      journal.push([r.date, entrepotLabel(r), livreurLabel(r), Number(r.nbLivraisons) || 0, Number(r.nbBacs) || 0, Number(r.km) || 0, ret, Number(r.incidents) || 0, r.client || "", r.adresse || "", r.codePostal || "", r.ville || "", r.tournee || "", r.sequence || "", r.source || "", r.commentaire || ""]);
+      var ke = entrepotKey(r), kl = livreurKey(r);
+      var e = byEnt[ke] = byEnt[ke] || { label: entrepotLabel(r), liv: 0, bacs: 0, km: 0, ret: 0 };
+      var l = byLiv[kl] = byLiv[kl] || { label: livreurLabel(r), liv: 0, bacs: 0, km: 0, ret: 0, days: {} };
+      [e, l].forEach(function (g) { g.liv += Number(r.nbLivraisons) || 0; g.bacs += Number(r.nbBacs) || 0; g.km += Number(r.km) || 0; g.ret += ret; });
+      l.days[r.date] = true;
+    });
+    var sEnt = [["Entrepôt", "Livraisons", "Bacs", "Km", "Retards signalés", "Taux de retard (%)"]];
+    Object.keys(byEnt).map(function (k) { return byEnt[k]; }).sort(function (a, b) { return b.liv - a.liv; }).forEach(function (g) {
+      sEnt.push([g.label, g.liv, g.bacs, Math.round(g.km * 10) / 10, g.ret, g.liv ? Math.round(g.ret / g.liv * 1000) / 10 : 0]);
+    });
+    var sLiv = [["Livreur", "Jours travaillés", "Livraisons", "Bacs", "Km", "Retards signalés", "Bacs / jour"]];
+    Object.keys(byLiv).map(function (k) { return byLiv[k]; }).sort(function (a, b) { return b.liv - a.liv; }).forEach(function (g) {
+      var nj = Object.keys(g.days).length;
+      sLiv.push([g.label, nj, g.liv, g.bacs, Math.round(g.km * 10) / 10, g.ret, nj ? Math.round(g.bacs / nj * 10) / 10 : 0]);
+    });
+    XLSXLite.downloadWorkbook("livraisons_" + period.start + "_" + period.end + ".xlsx", [
+      { name: "Journal", rows: journal, widths: [12, 22, 22, 11, 8, 8, 14, 10, 24, 30, 11, 16, 12, 10, 10, 30] },
+      { name: "Par entrepôt", rows: sEnt, widths: [26, 12, 10, 10, 16, 18] },
+      { name: "Par livreur", rows: sLiv, widths: [26, 16, 12, 10, 10, 16, 12] }
+    ]);
+    LM.toast("Export Excel téléchargé (" + rows.length + " ligne(s)).", "success");
   }
 
   // Classements de la période : jours les plus chargés, charge moyenne par jour de la semaine et
@@ -6751,7 +7007,6 @@
   function renderJournalTab() {
     var panel = document.getElementById("journalPanel");
     if (journalTab === "import") renderImportTab(panel);
-    else if (journalTab === "manuel") renderManualTab(panel);
     else renderHistoriqueTab(panel);
   }
 
@@ -6767,10 +7022,23 @@
         '<div class="text-sm">La première ligne du fichier doit contenir les en-têtes de colonnes.</div>' +
       '</div>' +
       '<input type="file" id="fileInput" accept=".xlsx" style="display:none" />' +
-      '<p class="text-sm icon-inline" style="margin-top:10px;"><a href="modele_import_livraisons.xlsx" download>' + LM.icon("download") + ' Télécharger un modèle de fichier Excel</a></p>' +
+      '<p class="text-sm icon-inline" style="margin-top:10px;"><a href="#" id="dlModele">' + LM.icon("download") + ' Télécharger un modèle de fichier Excel</a></p>' +
       '<div id="importPreview"></div>' +
       '</div>';
 
+    document.getElementById("dlModele").addEventListener("click", function (e) {
+      e.preventDefault();
+      var ent = DB.list("entrepots")[0], liv = DB.list("livreurs")[0];
+      var hier = DB.isoAddDays(DB.todayISO(), -1);
+      XLSXLite.downloadWorkbook("modele_import_livraisons.xlsx", [{
+        name: "Livraisons",
+        rows: [
+          ["Date", "Entrepôt", "Livreur", "Tournée", "Séquence", "Client", "N°", "Rue", "Code postal", "Ville", "Bacs", "Km", "Incidents", "Commentaire"],
+          [hier, ent ? ent.nom : "Entrepôt Paris Nord", liv ? DB.livreurNomComplet(liv) : "Jean Dupont", "T1", "1", "Boulangerie Soleil", "12", "rue des Lilas", "75010", "Paris", 4, 3.2, 0, "Exemple (à supprimer)"]
+        ],
+        widths: [12, 24, 22, 10, 10, 26, 8, 26, 12, 16, 8, 8, 10, 28]
+      }]);
+    });
     var undoBtn = document.getElementById("btnUndoLast");
     if (undoBtn) undoBtn.addEventListener("click", function () {
       var nb = lastBatch ? lastBatch.nbLignes : 0;
@@ -6876,11 +7144,22 @@
       var batchId = DB.uid("imp");
       var unmatchedEnt = {}, unmatchedLiv = {};
       var newRecords = [];
+      var flagsArr = [];        // pour chaque enregistrement : [{ code, line }]
+      var issueStats = {};      // code -> { n, lines: [] }
+      var todayIso = DB.todayISO();
+      var twoYearsAgo = DB.isoAddDays(todayIso, -730);
+      function flag(list, code, line) {
+        list.push(code);
+        var st = issueStats[code] = issueStats[code] || { n: 0, lines: [] };
+        st.n++; if (st.lines.length < 4) st.lines.push(line);
+      }
 
-      pendingImport.rows.forEach(function (row) {
+      pendingImport.rows.forEach(function (row, rowIdx) {
+        var line = rowIdx + 2; // la ligne 1 du fichier contient les en-têtes
+        var flags = [];
         var dateRaw = row[idxOf.date];
         var iso = parseDateCell(dateRaw);
-        if (!iso) return; // ligne sans date exploitable, ignorée
+        if (!iso) { flag([], "date_invalide", line); return; } // ligne sans date exploitable, ignorée
 
         var entNomRaw = idxOf.entrepot !== undefined ? (row[idxOf.entrepot] || "").toString().trim() : "";
         var entMatch = DB.resolveEntrepotByName(entNomRaw);
@@ -6889,6 +7168,19 @@
         var livNomRaw = idxOf.livreur !== undefined ? (row[idxOf.livreur] || "").toString().trim() : "";
         var livMatch = livNomRaw ? DB.resolveLivreurByName(livNomRaw) : null;
         if (livNomRaw && !livMatch) unmatchedLiv[livNomRaw] = true;
+
+        // Contrôles de cohérence de la ligne
+        if (!entNomRaw) flag(flags, "entrepot_vide", line);
+        else if (!entMatch) flag(flags, "entrepot_inconnu", line);
+        if (livNomRaw && !livMatch) flag(flags, "livreur_inconnu", line);
+        if (livMatch && !DB.livreurEmbaucheLe(livMatch, iso)) flag(flags, "livreur_non_embauche", line);
+        if (iso > todayIso) flag(flags, "date_future", line);
+        else if (iso < twoYearsAgo) flag(flags, "date_ancienne", line);
+        var bacsV = idxOf.nbBacs !== undefined ? Number(row[idxOf.nbBacs]) : 0;
+        if (isFinite(bacsV) && (bacsV < 0 || bacsV > 1000)) flag(flags, "bacs_aberrant", line);
+        var kmV = idxOf.km !== undefined ? Number(row[idxOf.km]) : 0;
+        if (isFinite(kmV) && (kmV < 0 || kmV > 1500)) flag(flags, "km_aberrant", line);
+        flagsArr.push(flags);
 
         // Chaque ligne du fichier = une commande = une livraison (nbLivraisons vaut toujours 1 ici).
         newRecords.push({
@@ -6916,6 +7208,53 @@
         });
       });
 
+      // Rapport de contrôle : problèmes bloquants / alertes avant d'enregistrer quoi que ce soit.
+      var ISSUE_DEF = {
+        date_invalide: { lvl: "erreur", label: "Date absente ou illisible — ligne ignorée" },
+        entrepot_vide: { lvl: "alerte", label: "Entrepôt non renseigné" },
+        date_future: { lvl: "alerte", label: "Date dans le futur" },
+        date_ancienne: { lvl: "alerte", label: "Date antérieure à plus de 2 ans" },
+        bacs_aberrant: { lvl: "alerte", label: "Nombre de bacs négatif ou supérieur à 1 000" },
+        km_aberrant: { lvl: "alerte", label: "Kilométrage négatif ou supérieur à 1 500 km" },
+        livreur_non_embauche: { lvl: "alerte", label: "Livreur pas encore embauché à cette date" },
+        entrepot_inconnu: { lvl: "info", label: "Entrepôt non reconnu (conservé tel quel)" },
+        livreur_inconnu: { lvl: "info", label: "Livreur non reconnu (conservé tel quel)" }
+      };
+      var issueCodes = Object.keys(issueStats);
+      var blocking = issueCodes.filter(function (c) { return ISSUE_DEF[c].lvl !== "info"; });
+      if (blocking.length) {
+        var nbFlagged = flagsArr.filter(function (f) { return f.some(function (c) { return ISSUE_DEF[c].lvl !== "info"; }); }).length;
+        var clean = newRecords.filter(function (r, i) { return !flagsArr[i].some(function (c) { return ISSUE_DEF[c].lvl !== "info"; }); });
+        var order = ["erreur", "alerte", "info"];
+        var rowsHtml = issueCodes.sort(function (a, b) { return order.indexOf(ISSUE_DEF[a].lvl) - order.indexOf(ISSUE_DEF[b].lvl); }).map(function (c) {
+          var d = ISSUE_DEF[c], st = issueStats[c];
+          var cls = d.lvl === "erreur" ? "badge-danger" : (d.lvl === "alerte" ? "badge-warning" : "badge-muted");
+          return '<tr><td><span class="badge ' + cls + '">' + (d.lvl === "erreur" ? "Erreur" : (d.lvl === "alerte" ? "Alerte" : "Info")) + '</span></td><td class="text-sm">' + d.label + '</td><td class="num">' + st.n + '</td><td class="text-sm text-faint">ligne' + (st.lines.length > 1 ? "s" : "") + ' ' + st.lines.join(", ") + (st.n > st.lines.length ? "…" : "") + '</td></tr>';
+        }).join("");
+        LM.openModal({
+          title: "Rapport de contrôle de l'import",
+          wide: true,
+          bodyHtml:
+            '<p style="margin-top:0;"><strong>' + newRecords.length + ' ligne(s) exploitable(s)</strong> sur ' + pendingImport.rows.length + ' — dont <strong>' + nbFlagged + '</strong> avec une alerte' +
+            (issueStats.date_invalide ? ', et <strong>' + issueStats.date_invalide.n + '</strong> ignorée(s) faute de date lisible' : '') + '.</p>' +
+            '<div class="table-wrap"><table><thead><tr><th>Niveau</th><th>Problème</th><th class="num">Lignes</th><th>Où (n° de ligne du fichier)</th></tr></thead><tbody>' + rowsHtml + '</tbody></table></div>' +
+            '<p class="hint">Les numéros de ligne correspondent au fichier Excel (la ligne 1 contient les en-têtes). Corrigez le fichier puis réimportez-le, ou choisissez ci-dessous.</p>',
+          footerHtml:
+            '<button class="btn btn-secondary" id="ctlCancel">Annuler l\'import</button>' +
+            '<button class="btn btn-secondary" id="ctlAll">Importer tout (' + newRecords.length + ')</button>' +
+            '<button class="btn btn-primary" id="ctlClean"' + (clean.length ? '' : ' disabled') + '>Importer sans les lignes à alerte (' + clean.length + ')</button>',
+          onMount: function (m) {
+            m.querySelector("#ctlCancel").addEventListener("click", LM.closeModal);
+            m.querySelector("#ctlAll").addEventListener("click", function () { LM.closeModal(); continueImport(); });
+            m.querySelector("#ctlClean").addEventListener("click", function () { LM.closeModal(); newRecords = clean; continueImport(); });
+          }
+        });
+        return;
+      }
+      continueImport();
+      return;
+
+      function continueImport() {
       // Doublons avec le journal existant ?
       var existingSig = {};
       DB.list("livraisons").forEach(function (r) { if (recordHasIdentity(r)) existingSig[recordSignature(r)] = true; });
@@ -6964,6 +7303,7 @@
           m.querySelector("#dupSkip").addEventListener("click", function () { LM.closeModal(); commit(fresh, dupes.length); });
         }
       });
+      } // fin de continueImport
     }
   }
 
@@ -6983,393 +7323,603 @@
   }
   function pad2(n) { n = String(n); return n.length < 2 ? "0" + n : n; }
 
-  // ---------------- Saisie manuelle ----------------
-  // Principe : deux "palettes" rapides (Dates, Entrepôts) sous forme de chips permettent de générer
-  // d'un clic toutes les lignes du produit cartésien dates × entrepôts dans une grille éditable pleine
-  // largeur ; chaque ligne garde ensuite ses propres livreur/bacs/livraisons/km/retards/commentaire,
-  // et peut être dupliquée (ex : 2 livreurs le même jour au même entrepôt) ou supprimée indépendamment.
-  // Un seul clic sur "Enregistrer" crée toutes les entrées en une fois. La colonne "Retards" crée
-  // automatiquement, pour chaque ligne où elle est renseignée (> 0), le signalement de retard
-  // correspondant (DB.upsertRetard, même mécanisme que le bouton "Gérer le retard" de la page
-  // Retards) : la nouvelle entrée du journal apparaît donc immédiatement dans la page Retards, liée
-  // par la même date/entrepôt/livreur — libre ensuite d'y préciser les clients concernés et le détail.
-  function renderManualTab(panel) {
-    var entrepots = DB.list("entrepots");
-    panel.innerHTML =
-      '<form id="manualForm" style="margin-top:14px;">' +
-        '<div class="grid grid-2" style="align-items:start;margin-bottom:16px;">' +
-          '<div class="field mb-0">' +
-            '<label>1. Dates</label>' +
-            '<div class="date-picker-panel">' +
-              '<div class="form-row" style="margin-bottom:0;align-items:flex-end;">' +
-                '<div class="field mb-0" style="flex:0 0 170px;"><label class="text-sm text-muted" style="margin-bottom:4px;">Ajouter une date</label><input type="date" id="manDateSingle" value="' + DB.todayISO() + '" /></div>' +
-                '<div class="field mb-0"><button type="button" class="btn btn-secondary btn-sm" id="btnAddDate">' + LM.icon("plus") + ' Ajouter</button></div>' +
-              '</div>' +
-              '<div class="divider" style="margin:14px 0;"></div>' +
-              '<div class="form-row" style="margin-bottom:0;align-items:flex-end;">' +
-                '<div class="field mb-0" style="flex:0 0 130px;"><label class="text-sm text-muted" style="margin-bottom:4px;">Du</label><input type="date" id="manRangeStart" /></div>' +
-                '<div class="field mb-0" style="flex:0 0 130px;"><label class="text-sm text-muted" style="margin-bottom:4px;">Au</label><input type="date" id="manRangeEnd" /></div>' +
-                '<div class="field mb-0"><div class="checkbox-row" style="height:38px;"><input type="checkbox" id="manSkipSunday" checked /><label for="manSkipSunday">Exclure les dimanches</label></div></div>' +
-                '<div class="field mb-0"><button type="button" class="btn btn-secondary btn-sm" id="btnAddRange">' + LM.icon("plus") + ' Plage</button></div>' +
-              '</div>' +
-              '<div id="manDatesChips" style="margin-top:14px;"></div>' +
-            '</div>' +
+  // ---------------- Saisie manuelle (pop-up) ----------------
+  // Principe : un pop-up avec un onglet par date. Dans chaque onglet, à gauche on cherche un livreur
+  // (il vient alors dans le cadre « Livreurs » de la date) ; en cliquant sur un livreur de ce cadre,
+  // la partie droite permet de chercher un entrepôt, qui vient dans le cadre « Entrepôts » avec ses
+  // quatre champs : commandes, bacs, retards, distance. Le bouton « Importer » enregistre tout d'un
+  // coup dans le journal. Le brouillon (variable `saisie`) survit à la fermeture du pop-up : rien
+  // n'est perdu si l'on referme par erreur. Le champ « Retards » crée, comme avant, le signalement
+  // correspondant dans la page Retards (DB.upsertRetard).
+  var saisie = { days: [], activeDate: null, activeLiv: {} };
+  var saisieIdx = null; // cache : date -> { "livreurId|entrepotId": nb de commandes déjà au journal }
+
+  function smNorm(s) {
+    if (!s) return "";
+    return s.toString().trim().toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/\s+/g, " ");
+  }
+
+  function saisieReset() { saisie.days = []; saisie.activeDate = null; saisie.activeLiv = {}; }
+
+  function saisieFindDay(iso) {
+    for (var i = 0; i < saisie.days.length; i++) { if (saisie.days[i].date === iso) return saisie.days[i]; }
+    return null;
+  }
+
+  function saisieAddDate(iso) {
+    if (!iso || !/^\d{4}-\d{2}-\d{2}$/.test(iso)) return false;
+    var existing = saisieFindDay(iso);
+    saisie.activeDate = iso;
+    if (existing) return false;
+    saisie.days.push({ date: iso, livreurs: [] });
+    saisie.days.sort(function (a, b) { return a.date < b.date ? -1 : (a.date > b.date ? 1 : 0); });
+    return true;
+  }
+
+  function saisieNewRow(entrepotId) {
+    return { uid: DB.uid("sme"), entrepotId: entrepotId, nbLivraisons: "", nbBacs: "", retards: "", km: "", errField: null };
+  }
+
+  function saisieFindLiv(day, livId) {
+    if (!day) return null;
+    for (var i = 0; i < day.livreurs.length; i++) { if (day.livreurs[i].livreurId === livId) return day.livreurs[i]; }
+    return null;
+  }
+
+  function saisieAddLivreur(day, livId) {
+    var lv = saisieFindLiv(day, livId);
+    if (!lv) { lv = { livreurId: livId, entrepots: [] }; day.livreurs.push(lv); }
+    return lv;
+  }
+
+  function saisieRowHasData(r) {
+    return r.nbLivraisons !== "" || r.nbBacs !== "" || r.retards !== "" || r.km !== "";
+  }
+
+  function saisieNum(v) { return Number(v) || 0; }
+
+  function saisieDayTotals(day) {
+    var t = { liv: day.livreurs.length, ent: 0, cmd: 0, bacs: 0 };
+    day.livreurs.forEach(function (lv) {
+      t.ent += lv.entrepots.length;
+      lv.entrepots.forEach(function (r) { t.cmd += saisieNum(r.nbLivraisons); t.bacs += saisieNum(r.nbBacs); });
+    });
+    return t;
+  }
+
+  function saisieTotals() {
+    var t = { dates: 0, ent: 0, cmd: 0, bacs: 0 };
+    saisie.days.forEach(function (d) {
+      var x = saisieDayTotals(d);
+      if (x.ent) t.dates++;
+      t.ent += x.ent; t.cmd += x.cmd; t.bacs += x.bacs;
+    });
+    return t;
+  }
+
+  // Commandes déjà présentes au journal pour (date, livreur, entrepôt) : sert à avertir d'un doublon.
+  function saisieJournalCount(date, livId, entId) {
+    if (!saisieIdx) saisieIdx = {};
+    var m = saisieIdx[date];
+    if (!m) {
+      m = saisieIdx[date] = {};
+      DB.list("livraisons").forEach(function (r) {
+        if (r.date !== date || !r.livreurId || !r.entrepotId) return;
+        var k = r.livreurId + "|" + r.entrepotId;
+        var n = (r.nbLivraisons !== undefined && r.nbLivraisons !== null) ? (Number(r.nbLivraisons) || 0) : 1;
+        m[k] = (m[k] || 0) + n;
+      });
+    }
+    return m[livId + "|" + entId] || 0;
+  }
+
+  // Avertissement affiché à côté d'un livreur pour la date de l'onglet (repos, absence, pas embauché).
+  function saisieLivreurWarn(l, date) {
+    if (!DB.livreurEmbaucheLe(l, date)) return "Pas encore embauché";
+    var e = DB.planningEntreeFor(l.id, date);
+    if (e && e.type !== "travail") return ctrlTypeLabel(e.type);
+    return "";
+  }
+
+  function saisieDateLabel(iso) {
+    return new Date(iso + "T00:00:00").toLocaleDateString("fr-FR", { weekday: "short", day: "2-digit", month: "2-digit" });
+  }
+
+  // Prépare le brouillon depuis le contrôle quotidien : une date + des livreurs (avec leur entrepôt).
+  function saisiePrefill(dateIso, pairs) {
+    var added = 0;
+    saisieAddDate(dateIso);
+    var day = saisieFindDay(dateIso);
+    pairs.forEach(function (p) {
+      var lv = saisieAddLivreur(day, p.livreurId);
+      if (p.entrepotId && !lv.entrepots.some(function (r) { return r.entrepotId === p.entrepotId; })) {
+        lv.entrepots.push(saisieNewRow(p.entrepotId));
+        added++;
+      }
+      saisie.activeLiv[dateIso] = p.livreurId;
+    });
+    return added;
+  }
+
+  function openSaisieModal() {
+    saisieIdx = {};
+    if (!saisie.days.length) saisieAddDate(DB.todayISO());
+    else if (!saisieFindDay(saisie.activeDate)) saisie.activeDate = saisie.days[0].date;
+
+    var pendingRm = null; // clé d'une suppression en attente de confirmation (2e clic)
+    var addOpen = false;
+    var resetArmed = false;
+    var modalEl = null;
+
+    function q(sel) { return modalEl.querySelector(sel); }
+    function activeDay() { return saisieFindDay(saisie.activeDate); }
+    function activeLivEntry() {
+      var day = activeDay();
+      return day ? saisieFindLiv(day, saisie.activeLiv[day.date]) : null;
+    }
+    function disarm() { pendingRm = null; resetArmed = false; }
+
+    LM.openModal({
+      title: "Saisie manuelle des livraisons",
+      bodyHtml:
+        '<div class="sm-tabs" id="smTabs"></div>' +
+        '<div id="smAddPanel"></div>' +
+        '<div id="smBody"></div>',
+      footerHtml:
+        '<span class="sm-summary" id="smSummary"></span>' +
+        '<button type="button" class="btn btn-ghost" id="smReset">Tout effacer</button>' +
+        '<button type="button" class="btn btn-secondary" id="smClose">Fermer</button>' +
+        '<button type="button" class="btn btn-primary" id="smImport">' + LM.icon("check") + ' Importer</button>',
+      onMount: function (modal) {
+        modalEl = modal;
+        modal.classList.add("modal-saisie");
+        renderAll();
+        q("#smClose").addEventListener("click", LM.closeModal);
+        q("#smImport").addEventListener("click", tryImport);
+        q("#smReset").addEventListener("click", function () {
+          if (!resetArmed) { disarm(); resetArmed = true; renderSummary(); return; }
+          saisieReset();
+          saisieAddDate(DB.todayISO());
+          disarm();
+          renderAll();
+        });
+      }
+    });
+
+    // ------------------------------------------------------------------ rendu
+    function renderAll() {
+      renderTabs();
+      renderAddPanel();
+      renderBody();
+      renderSummary();
+    }
+
+    function renderSummary() {
+      var t = saisieTotals();
+      var el = q("#smSummary");
+      el.innerHTML = t.ent
+        ? '<strong>' + t.ent + '</strong> entrée' + (t.ent > 1 ? 's' : '') + ' sur <strong>' + t.dates + '</strong> date' + (t.dates > 1 ? 's' : '') + ' · <strong>' + t.cmd + '</strong> commande' + (t.cmd > 1 ? 's' : '') + ' · <strong>' + t.bacs + '</strong> bac' + (t.bacs > 1 ? 's' : '')
+        : 'Aucune entrée saisie pour le moment';
+      var btn = q("#smImport");
+      btn.disabled = !t.ent;
+      btn.innerHTML = LM.icon("check") + ' Importer' + (t.ent ? ' (' + t.ent + ')' : '');
+      var rst = q("#smReset");
+      rst.textContent = resetArmed ? "Confirmer l'effacement" : "Tout effacer";
+      rst.className = "btn " + (resetArmed ? "btn-danger" : "btn-ghost");
+      rst.style.display = (t.ent || saisie.days.length > 1) ? "" : "none";
+    }
+
+    function renderTabs() {
+      var el = q("#smTabs");
+      el.innerHTML = saisie.days.map(function (d) {
+        var t = saisieDayTotals(d);
+        var active = d.date === saisie.activeDate;
+        var armed = pendingRm === "d:" + d.date;
+        var rm = armed
+          ? '<button type="button" class="sm-tab-x sm-tab-x-confirm" data-smrm="' + d.date + '">Supprimer ?</button>'
+          : '<button type="button" class="sm-tab-x" data-smrm="' + d.date + '" title="Retirer cette date">' + LM.icon("close") + '</button>';
+        return '<div class="sm-tab' + (active ? ' active' : '') + '">' +
+          '<button type="button" class="sm-tab-main" data-smdate="' + d.date + '">' + LM.escapeHtml(saisieDateLabel(d.date)) +
+          (t.ent ? ' <span class="sm-tab-n">' + t.ent + '</span>' : '') + '</button>' + rm + '</div>';
+      }).join("") +
+        '<button type="button" class="btn btn-secondary btn-sm" id="smAddDate">' + LM.icon("plus") + ' Ajouter une date</button>';
+
+      el.querySelectorAll("[data-smdate]").forEach(function (b) {
+        b.addEventListener("click", function () {
+          saisie.activeDate = b.getAttribute("data-smdate");
+          disarm();
+          renderAll();
+        });
+      });
+      el.querySelectorAll("[data-smrm]").forEach(function (b) {
+        b.addEventListener("click", function () {
+          var iso = b.getAttribute("data-smrm");
+          var d = saisieFindDay(iso);
+          if (!d) return;
+          var hasData = d.livreurs.length > 0;
+          if (hasData && pendingRm !== "d:" + iso) { disarm(); pendingRm = "d:" + iso; renderTabs(); renderSummary(); return; }
+          saisie.days = saisie.days.filter(function (x) { return x.date !== iso; });
+          if (!saisie.days.length) saisieAddDate(DB.todayISO());
+          else if (saisie.activeDate === iso) saisie.activeDate = saisie.days[0].date;
+          disarm();
+          renderAll();
+        });
+      });
+      q("#smAddDate").addEventListener("click", function () {
+        addOpen = !addOpen;
+        renderAddPanel();
+      });
+    }
+
+    function renderAddPanel() {
+      var el = q("#smAddPanel");
+      if (!addOpen) { el.innerHTML = ""; return; }
+      var last = saisie.days.length ? saisie.days[saisie.days.length - 1].date : DB.todayISO();
+      var suggestion = saisie.days.length ? ctrlAddDays(last, 1) : last;
+      el.innerHTML =
+        '<div class="date-picker-panel sm-addpanel"><div class="form-row" style="margin-bottom:0;align-items:flex-end;">' +
+          '<div class="field mb-0" style="flex:0 0 160px;"><label class="text-sm text-muted" style="margin-bottom:4px;">Une date</label><input type="date" id="smDateOne" value="' + suggestion + '" /></div>' +
+          '<div class="field mb-0"><button type="button" class="btn btn-secondary btn-sm" id="smDateOneBtn">' + LM.icon("plus") + ' Ajouter</button></div>' +
+          '<div class="sm-sep"></div>' +
+          '<div class="field mb-0" style="flex:0 0 140px;"><label class="text-sm text-muted" style="margin-bottom:4px;">Du</label><input type="date" id="smRangeStart" /></div>' +
+          '<div class="field mb-0" style="flex:0 0 140px;"><label class="text-sm text-muted" style="margin-bottom:4px;">Au</label><input type="date" id="smRangeEnd" /></div>' +
+          '<div class="field mb-0"><div class="checkbox-row" style="height:38px;"><input type="checkbox" id="smSkipSun" checked /><label for="smSkipSun">Sans les dimanches</label></div></div>' +
+          '<div class="field mb-0"><button type="button" class="btn btn-secondary btn-sm" id="smRangeBtn">' + LM.icon("plus") + ' Ajouter la plage</button></div>' +
+        '</div></div>';
+      q("#smDateOneBtn").addEventListener("click", function () {
+        var v = q("#smDateOne").value;
+        if (!v) { LM.toast("Choisissez une date.", "danger"); return; }
+        saisieAddDate(v);
+        addOpen = false; disarm();
+        renderAll();
+      });
+      q("#smRangeBtn").addEventListener("click", function () {
+        var s = q("#smRangeStart").value, e = q("#smRangeEnd").value;
+        if (!s || !e || s > e) { LM.toast("Plage de dates invalide.", "danger"); return; }
+        var skip = q("#smSkipSun").checked, first = null, n = 0, d = s;
+        while (d <= e && n < 62) {
+          var isSunday = new Date(d + "T00:00:00").getDay() === 0;
+          if (!(skip && isSunday)) { saisieAddDate(d); if (!first) first = d; n++; }
+          d = ctrlAddDays(d, 1);
+        }
+        if (first) saisie.activeDate = first;
+        if (d <= e) LM.toast("Plage limitée à 62 jours.", "danger");
+        addOpen = false; disarm();
+        renderAll();
+      });
+    }
+
+    function renderBody() {
+      var day = activeDay();
+      var body = q("#smBody");
+      if (!day) { body.innerHTML = ""; return; }
+      body.innerHTML =
+        '<div class="sm-cols">' +
+          '<div class="sm-col">' +
+            '<label class="sm-label">Livreurs <span class="sm-label-sub">— ' + LM.escapeHtml(saisieDateLabel(day.date)) + '</span></label>' +
+            '<div class="sm-search"><span class="sm-search-ic">' + LM.icon("search") + '</span><input type="text" class="sm-input" id="smLivSearch" placeholder="Rechercher un livreur…" autocomplete="off" /><div class="sm-drop" id="smLivDrop" hidden></div></div>' +
+            '<div class="sm-frame" id="smLivFrame"></div>' +
           '</div>' +
-          '<div class="field mb-0" style="display:flex;flex-direction:column;gap:16px;">' +
-            '<div>' +
-              '<label>2. Entrepôts</label>' +
-              '<div class="date-picker-panel">' +
-                '<div class="form-row" style="margin-bottom:0;align-items:flex-end;">' +
-                  '<div class="field mb-0" style="flex:1;min-width:200px;"><label class="text-sm text-muted" style="margin-bottom:4px;">Ajouter un entrepôt</label><select id="manEntSelect"><option value="">Sélectionner…</option>' +
-                    entrepots.map(function (e) { return '<option value="' + e.id + '">' + LM.escapeHtml(e.nom) + '</option>'; }).join("") +
-                  '</select></div>' +
-                  '<div class="field mb-0"><button type="button" class="btn btn-secondary btn-sm" id="btnAddEnt">' + LM.icon("plus") + ' Ajouter</button></div>' +
-                '</div>' +
-                '<div id="manEntsChips" style="margin-top:14px;"></div>' +
-              '</div>' +
-            '</div>' +
-            '<div>' +
-              '<label>3. Livreurs <span class="text-faint" style="font-weight:500;">(optionnel)</span></label>' +
-              '<div class="date-picker-panel">' +
-                '<div class="form-row" style="margin-bottom:0;align-items:flex-end;">' +
-                  '<div class="field mb-0" style="flex:1;min-width:200px;"><label class="text-sm text-muted" style="margin-bottom:4px;">Pré-sélectionner un livreur</label><select id="manLivSelect"><option value="">Sélectionner…</option></select></div>' +
-                  '<div class="field mb-0"><button type="button" class="btn btn-secondary btn-sm" id="btnAddLiv">' + LM.icon("plus") + ' Ajouter</button></div>' +
-                '</div>' +
-                '<div id="manLivsChips" style="margin-top:14px;"></div>' +
-                '<div class="hint" style="margin-top:10px;">Sans sélection, le livreur reste à choisir ligne par ligne dans la grille.</div>' +
-              '</div>' +
-            '</div>' +
+          '<div class="sm-col">' +
+            '<label class="sm-label" id="smEntLabel">Entrepôts</label>' +
+            '<div class="sm-search"><span class="sm-search-ic">' + LM.icon("search") + '</span><input type="text" class="sm-input" id="smEntSearch" placeholder="Rechercher un entrepôt…" autocomplete="off" /><div class="sm-drop" id="smEntDrop" hidden></div></div>' +
+            '<div class="sm-frame" id="smEntFrame"></div>' +
           '</div>' +
-        '</div>' +
-        '<div class="flex gap-14" style="margin-bottom:18px;align-items:center;flex-wrap:wrap;">' +
-          '<button type="button" class="btn btn-primary btn-sm" id="btnGenerateGrid">' + LM.icon("check") + ' Générer les lignes</button>' +
-          '<span class="text-sm text-faint">Ajoute une ligne pour chaque combinaison (dates × entrepôts, × livreurs si pré-sélectionnés) non encore présente dans la grille ; ajustez ensuite librement chaque ligne.</span>' +
-        '</div>' +
-        '<p class="hint" style="margin-top:-8px;">La colonne <strong>Retards</strong> crée automatiquement, pour chaque ligne renseignée, le signalement correspondant dans la page <strong>Retards</strong> (même date, entrepôt et livreur) — vous pourrez ensuite y préciser les clients concernés.</p>' +
-        '<div class="table-wrap" style="margin-bottom:16px;"><table><thead><tr>' +
-          '<th>Date</th><th>Entrepôt</th><th style="width:190px;">Livreur</th><th class="num" style="width:100px;">Livraisons *</th><th class="num" style="width:90px;">Bacs</th><th class="num" style="width:90px;">Km</th><th class="num" style="width:90px;" title="Crée automatiquement un signalement dans la page Retards">Retards</th><th>Commentaire</th><th style="width:76px;"></th>' +
-        '</tr></thead><tbody id="manGridBody"></tbody></table></div>' +
-        '<button type="submit" class="btn btn-primary" id="manSubmitBtn"></button>' +
-      '</form>';
-
-    manualSync = syncGridFromDom;
-    renderDateChips();
-    renderEntChips();
-    renderLivChips();
-    refreshLivSelectOptions();
-    renderGridBody();
-
-    document.getElementById("btnAddDate").addEventListener("click", function () {
-      var input = document.getElementById("manDateSingle");
-      if (!input.value) return;
-      if (addManualDate(input.value)) renderDateChips();
-      else LM.toast("Cette date est déjà dans la sélection.", "danger");
-    });
-
-    document.getElementById("btnAddRange").addEventListener("click", function () {
-      var s = document.getElementById("manRangeStart").value;
-      var e = document.getElementById("manRangeEnd").value;
-      if (!s || !e || s > e) { LM.toast("Plage de dates invalide.", "danger"); return; }
-      var skipSunday = document.getElementById("manSkipSunday").checked;
-      var added = 0;
-      for (var d = new Date(s); d <= new Date(e); d.setDate(d.getDate() + 1)) {
-        if (skipSunday && d.getDay() === 0) continue;
-        if (addManualDate(d.toISOString().slice(0, 10))) added++;
-      }
-      renderDateChips();
-      if (added) LM.toast(added + " date(s) ajoutée(s) à la sélection.", "success");
-      else LM.toast("Toutes les dates de cette plage sont déjà sélectionnées.", "danger");
-    });
-
-    document.getElementById("btnAddEnt").addEventListener("click", function () {
-      var sel = document.getElementById("manEntSelect");
-      if (!sel.value) return;
-      if (manualEntrepots.indexOf(sel.value) === -1) {
-        manualEntrepots.push(sel.value);
-        renderEntChips();
-        refreshLivSelectOptions();
-      } else {
-        LM.toast("Cet entrepôt est déjà dans la sélection.", "danger");
-      }
-      sel.value = "";
-    });
-
-    document.getElementById("btnAddLiv").addEventListener("click", function () {
-      var sel = document.getElementById("manLivSelect");
-      if (!sel.value) return;
-      if (manualLivreurs.indexOf(sel.value) === -1) {
-        manualLivreurs.push(sel.value);
-        renderLivChips();
-      } else {
-        LM.toast("Ce livreur est déjà dans la sélection.", "danger");
-      }
-      sel.value = "";
-    });
-
-    document.getElementById("btnGenerateGrid").addEventListener("click", function () {
-      if (!manualDates.length || !manualEntrepots.length) { LM.toast("Sélectionnez au moins une date et un entrepôt avant de générer la grille.", "danger"); return; }
-      syncGridFromDom();
-      var added = 0, skipped = 0;
-      manualDates.forEach(function (d) {
-        manualEntrepots.forEach(function (entId) {
-          if (manualLivreurs.length) {
-            manualLivreurs.forEach(function (livId) {
-              if (!DB.livreurAEntrepot(DB.get("livreurs", livId), entId)) { skipped++; return; } // livreur non rattaché à cet entrepôt : combinaison ignorée
-              var exists = manualGridRows.some(function (r) { return r.date === d && r.entrepotId === entId && r.livreurId === livId; });
-              if (!exists) {
-                manualGridRows.push({ id: DB.uid("mgr"), date: d, entrepotId: entId, livreurId: livId, nbLivraisons: "", nbBacs: "", km: "", retards: "", commentaire: "" });
-                added++;
-              }
-            });
-          } else {
-            var exists = manualGridRows.some(function (r) { return r.date === d && r.entrepotId === entId; });
-            if (!exists) {
-              manualGridRows.push({ id: DB.uid("mgr"), date: d, entrepotId: entId, livreurId: null, nbLivraisons: "", nbBacs: "", km: "", retards: "", commentaire: "" });
-              added++;
-            }
-          }
-        });
-      });
-      renderGridBody();
-      var msg = added ? added + " ligne(s) ajoutée(s) à la grille." : "Toutes ces combinaisons sont déjà présentes dans la grille.";
-      if (skipped) msg += " " + skipped + " combinaison(s) ignorée(s) (livreur non rattaché à l'entrepôt concerné).";
-      LM.toast(msg, added ? "success" : "danger");
-    });
-
-    document.getElementById("manualForm").addEventListener("submit", function (e) {
-      e.preventDefault();
-      trySubmit();
-    });
-
-    // ---------------- Dates : chips ----------------
-    function addManualDate(iso) {
-      if (!iso || manualDates.indexOf(iso) !== -1) return false;
-      manualDates.push(iso);
-      manualDates.sort();
-      return true;
-    }
-
-    function renderDateChips() {
-      var wrap = document.getElementById("manDatesChips");
-      if (!manualDates.length) {
-        wrap.innerHTML = '<p class="text-sm text-faint" style="margin:0;">Aucune date sélectionnée pour l\'instant.</p>';
-        return;
-      }
-      wrap.innerHTML =
-        '<div class="text-sm" style="margin-bottom:8px;font-weight:700;color:var(--color-text-muted);">' + manualDates.length + ' jour' + (manualDates.length > 1 ? "s" : "") + ' sélectionné' + (manualDates.length > 1 ? "s" : "") + '</div>' +
-        '<div class="date-chip-list">' +
-          manualDates.map(function (iso) {
-            return '<span class="date-chip">' + DB.fmtDate(iso) + '<button type="button" data-rmdate="' + iso + '" title="Retirer cette date">' + LM.icon("close") + '</button></span>';
-          }).join("") +
         '</div>';
-      wrap.querySelectorAll("[data-rmdate]").forEach(function (btn) {
-        btn.addEventListener("click", function () {
-          var idx = manualDates.indexOf(btn.getAttribute("data-rmdate"));
-          if (idx !== -1) manualDates.splice(idx, 1);
-          renderDateChips();
-        });
-      });
+      renderLivFrame();
+      renderEntFrame();
+      bindSearch(q("#smLivSearch"), q("#smLivDrop"), livItems, pickLivreur);
+      bindSearch(q("#smEntSearch"), q("#smEntDrop"), entItems, pickEntrepot);
     }
 
-    // ---------------- Entrepôts : chips ----------------
-    function renderEntChips() {
-      var wrap = document.getElementById("manEntsChips");
-      if (!manualEntrepots.length) {
-        wrap.innerHTML = '<p class="text-sm text-faint" style="margin:0;">Aucun entrepôt sélectionné pour l\'instant.</p>';
+    // ------------------------------------------------------------------ cadre livreurs
+    function renderLivFrame() {
+      var day = activeDay();
+      var frame = q("#smLivFrame");
+      if (!frame || !day) return;
+      if (!day.livreurs.length) {
+        frame.innerHTML = '<div class="sm-empty">Aucun livreur pour cette date.<br />Recherchez un livreur ci-dessus pour l\'ajouter.</div>';
         return;
       }
-      wrap.innerHTML =
-        '<div class="text-sm" style="margin-bottom:8px;font-weight:700;color:var(--color-text-muted);">' + manualEntrepots.length + ' entrepôt' + (manualEntrepots.length > 1 ? "s" : "") + ' sélectionné' + (manualEntrepots.length > 1 ? "s" : "") + '</div>' +
-        '<div class="date-chip-list">' +
-          manualEntrepots.map(function (id) {
-            var ent = DB.get("entrepots", id);
-            return '<span class="date-chip">' + LM.escapeHtml(ent ? ent.nom : "Entrepôt supprimé") + '<button type="button" data-rment="' + id + '" title="Retirer cet entrepôt">' + LM.icon("close") + '</button></span>';
-          }).join("") +
-        '</div>';
-      wrap.querySelectorAll("[data-rment]").forEach(function (btn) {
-        btn.addEventListener("click", function () {
-          var idx = manualEntrepots.indexOf(btn.getAttribute("data-rment"));
-          if (idx !== -1) manualEntrepots.splice(idx, 1);
-          renderEntChips();
-          refreshLivSelectOptions();
+      var activeId = saisie.activeLiv[day.date];
+      frame.innerHTML = day.livreurs.map(function (lv) {
+        var l = DB.get("livreurs", lv.livreurId);
+        var name = l ? DB.livreurNomComplet(l) : "Livreur supprimé";
+        var cmd = 0;
+        lv.entrepots.forEach(function (r) { cmd += saisieNum(r.nbLivraisons); });
+        var meta = lv.entrepots.length
+          ? lv.entrepots.length + ' entrepôt' + (lv.entrepots.length > 1 ? 's' : '') + ' · ' + cmd + ' commande' + (cmd > 1 ? 's' : '')
+          : 'Aucun entrepôt';
+        var warn = l ? saisieLivreurWarn(l, day.date) : "";
+        var hasData = lv.entrepots.length > 0;
+        var armed = pendingRm === "l:" + lv.livreurId;
+        return '<div class="sm-liv' + (lv.livreurId === activeId ? ' active' : '') + (lv.entrepots.length ? '' : ' sm-liv-empty') + '" data-smliv="' + lv.livreurId + '" tabindex="0" role="button">' +
+          '<div class="sm-liv-main"><span class="sm-liv-name">' + LM.escapeHtml(name) + '</span>' +
+          '<span class="sm-liv-meta">' + meta + '</span>' +
+          (warn ? '<span class="badge badge-warning sm-liv-warn">' + LM.escapeHtml(warn) + '</span>' : '') + '</div>' +
+          (armed
+            ? '<button type="button" class="sm-x sm-x-confirm" data-smlivrm="' + lv.livreurId + '">Retirer ?</button>'
+            : '<button type="button" class="sm-x" data-smlivrm="' + lv.livreurId + '" title="Retirer ce livreur">' + LM.icon("close") + '</button>') +
+          '</div>';
+      }).join("");
+
+      frame.querySelectorAll("[data-smliv]").forEach(function (card) {
+        function select() {
+          saisie.activeLiv[day.date] = card.getAttribute("data-smliv");
+          disarm();
+          renderLivFrame();
+          renderEntFrame();
+          renderSummary();
+        }
+        card.addEventListener("click", select);
+        card.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); select(); } });
+      });
+      frame.querySelectorAll("[data-smlivrm]").forEach(function (b) {
+        b.addEventListener("click", function (e) {
+          e.stopPropagation();
+          var id = b.getAttribute("data-smlivrm");
+          var lv = saisieFindLiv(day, id);
+          if (!lv) return;
+          var hasData = lv.entrepots.some(saisieRowHasData);
+          if (hasData && pendingRm !== "l:" + id) { disarm(); pendingRm = "l:" + id; renderLivFrame(); renderSummary(); return; }
+          day.livreurs = day.livreurs.filter(function (x) { return x.livreurId !== id; });
+          if (saisie.activeLiv[day.date] === id) saisie.activeLiv[day.date] = day.livreurs.length ? day.livreurs[0].livreurId : null;
+          disarm();
+          renderLivFrame(); renderEntFrame(); renderTabs(); renderSummary();
         });
       });
     }
 
-    // ---------------- Livreurs : chips (pré-sélection optionnelle) ----------------
-    // La liste proposée dépend des entrepôts déjà choisis à l'étape 2 (un livreur n'a de sens à
-    // pré-sélectionner que s'il est rattaché à au moins un des entrepôts retenus) ; elle est donc
-    // reconstruite à chaque ajout/retrait d'entrepôt.
-    function refreshLivSelectOptions() {
-      var sel = document.getElementById("manLivSelect");
-      var btn = document.getElementById("btnAddLiv");
-      if (!sel) return;
-      if (!manualEntrepots.length) {
-        sel.innerHTML = '<option value="">Sélectionnez d\'abord un entrepôt…</option>';
-        sel.disabled = true;
-        if (btn) btn.disabled = true;
+    function livItems() {
+      var day = activeDay();
+      if (!day) return [];
+      return DB.list("livreurs").filter(function (l) { return !saisieFindLiv(day, l.id); }).map(function (l) {
+        var ents = (Array.isArray(l.entrepotIds) ? l.entrepotIds : []).map(function (id) { return DB.entrepotNom(id); }).filter(function (x) { return !!x; });
+        return { id: l.id, label: DB.livreurNomComplet(l), sub: ents.join(", "), warn: saisieLivreurWarn(l, day.date) };
+      }).sort(function (a, b) { return a.label.localeCompare(b.label, "fr"); });
+    }
+
+    function pickLivreur(item) {
+      var day = activeDay();
+      if (!day) return;
+      saisieAddLivreur(day, item.id);
+      saisie.activeLiv[day.date] = item.id;
+      disarm();
+      var inp = q("#smLivSearch");
+      inp.value = "";
+      renderLivFrame(); renderEntFrame(); renderTabs(); renderSummary();
+      q("#smEntSearch").focus();
+    }
+
+    // ------------------------------------------------------------------ cadre entrepôts
+    function renderEntFrame() {
+      var day = activeDay();
+      var frame = q("#smEntFrame");
+      var label = q("#smEntLabel");
+      var search = q("#smEntSearch");
+      if (!frame || !day) return;
+      var lv = activeLivEntry();
+      if (!lv) {
+        label.innerHTML = 'Entrepôts';
+        search.disabled = true;
+        search.placeholder = "Choisissez d'abord un livreur";
+        frame.innerHTML = '<div class="sm-empty">' + (day.livreurs.length
+          ? 'Cliquez sur un livreur dans le cadre de gauche<br />pour saisir ses entrepôts.'
+          : 'Ajoutez un livreur à gauche pour commencer.') + '</div>';
         return;
       }
-      var livreurs = DB.list("livreurs").filter(function (l) {
-        return manualEntrepots.some(function (entId) { return DB.livreurAEntrepot(l, entId); });
-      }).sort(function (a, b) { return DB.livreurNomComplet(a).localeCompare(DB.livreurNomComplet(b), "fr"); });
-      sel.disabled = false;
-      if (btn) btn.disabled = false;
-      sel.innerHTML = '<option value="">Sélectionner…</option>' +
-        livreurs.map(function (l) { return '<option value="' + l.id + '">' + LM.escapeHtml(DB.livreurNomComplet(l)) + '</option>'; }).join("");
-    }
-
-    function renderLivChips() {
-      var wrap = document.getElementById("manLivsChips");
-      if (!manualLivreurs.length) {
-        wrap.innerHTML = '<p class="text-sm text-faint" style="margin:0;">Aucun livreur pré-sélectionné.</p>';
+      var l = DB.get("livreurs", lv.livreurId);
+      label.innerHTML = 'Entrepôts <span class="sm-label-sub">— ' + LM.escapeHtml(l ? DB.livreurNomComplet(l) : "Livreur supprimé") + '</span>';
+      search.disabled = false;
+      search.placeholder = "Rechercher un entrepôt…";
+      if (!lv.entrepots.length) {
+        frame.innerHTML = '<div class="sm-empty">Aucun entrepôt pour ce livreur.<br />Recherchez un entrepôt ci-dessus pour l\'ajouter.</div>';
         return;
       }
-      wrap.innerHTML =
-        '<div class="text-sm" style="margin-bottom:8px;font-weight:700;color:var(--color-text-muted);">' + manualLivreurs.length + ' livreur' + (manualLivreurs.length > 1 ? "s" : "") + ' pré-sélectionné' + (manualLivreurs.length > 1 ? "s" : "") + '</div>' +
-        '<div class="date-chip-list">' +
-          manualLivreurs.map(function (id) {
-            var l = DB.get("livreurs", id);
-            return '<span class="date-chip">' + LM.escapeHtml(l ? DB.livreurNomComplet(l) : "Livreur supprimé") + '<button type="button" data-rmliv="' + id + '" title="Retirer ce livreur">' + LM.icon("close") + '</button></span>';
-          }).join("") +
-        '</div>';
-      wrap.querySelectorAll("[data-rmliv]").forEach(function (btn) {
-        btn.addEventListener("click", function () {
-          var idx = manualLivreurs.indexOf(btn.getAttribute("data-rmliv"));
-          if (idx !== -1) manualLivreurs.splice(idx, 1);
-          renderLivChips();
-        });
-      });
-    }
-
-    // ---------------- Grille ----------------
-    // Relit les valeurs actuellement affichées dans les champs de la grille et les recopie dans
-    // manualGridRows : à appeler avant toute mutation structurelle (ajout/duplication/suppression de
-    // lignes, ou soumission) pour ne jamais perdre ce que l'utilisateur vient de saisir.
-    function syncGridFromDom() {
-      var body = document.getElementById("manGridBody");
-      if (!body) return;
-      manualGridRows.forEach(function (row) {
-        var livSel = body.querySelector('[data-field="livreurId"][data-row="' + row.id + '"]');
-        var f = function (name) { return body.querySelector('[data-field="' + name + '"][data-row="' + row.id + '"]'); };
-        if (livSel) row.livreurId = livSel.value || null;
-        ["nbLivraisons", "nbBacs", "km", "retards", "commentaire"].forEach(function (name) {
-          var input = f(name);
-          if (input) row[name] = input.value;
-        });
-      });
-    }
-
-    function clearRowErrors() {
-      document.querySelectorAll(".input-error").forEach(function (el) { el.classList.remove("input-error"); });
-    }
-
-    function updateSubmitLabel() {
-      var btn = document.getElementById("manSubmitBtn");
-      if (!btn) return;
-      var n = manualGridRows.length;
-      btn.innerHTML = LM.icon("check") + " Enregistrer " + (n ? n + " entrée" + (n > 1 ? "s" : "") : "les entrées");
-      btn.disabled = !n;
-    }
-
-    function renderGridBody() {
-      var body = document.getElementById("manGridBody");
-      var sorted = manualGridRows.slice().sort(function (a, b) {
-        if (a.date !== b.date) return a.date < b.date ? -1 : 1;
-        var an = DB.entrepotNom(a.entrepotId) || "", bn = DB.entrepotNom(b.entrepotId) || "";
-        return an.localeCompare(bn, "fr");
-      });
-      if (!sorted.length) {
-        body.innerHTML = '<tr class="empty-row"><td colspan="9">Ajoutez des dates et des entrepôts ci-dessus, puis cliquez sur « Générer les lignes ».</td></tr>';
-      } else {
-        body.innerHTML = sorted.map(function (row) {
-          var livreurs = DB.list("livreurs").filter(function (l) { return DB.livreurAEntrepot(l, row.entrepotId); });
-          var val = function (v) { return v !== undefined && v !== null ? v : ""; };
-          return '<tr>' +
-            '<td class="text-sm" style="white-space:nowrap;">' + DB.fmtDate(row.date) + '</td>' +
-            '<td class="text-sm">' + LM.escapeHtml(DB.entrepotNom(row.entrepotId) || "—") + '</td>' +
-            '<td><select class="table-input" data-field="livreurId" data-row="' + row.id + '"><option value="">Non précisé</option>' +
-              livreurs.map(function (l) { return '<option value="' + l.id + '"' + (l.id === row.livreurId ? " selected" : "") + '>' + LM.escapeHtml(DB.livreurNomComplet(l)) + '</option>'; }).join("") +
-            '</select></td>' +
-            '<td><input type="number" min="0" class="table-input table-input-num" data-field="nbLivraisons" data-row="' + row.id + '" value="' + val(row.nbLivraisons) + '" /></td>' +
-            '<td><input type="number" min="0" class="table-input table-input-num" data-field="nbBacs" data-row="' + row.id + '" value="' + val(row.nbBacs) + '" /></td>' +
-            '<td><input type="number" step="0.1" min="0" class="table-input table-input-num" data-field="km" data-row="' + row.id + '" value="' + val(row.km) + '" /></td>' +
-            '<td><input type="number" min="0" class="table-input table-input-num" data-field="retards" data-row="' + row.id + '" value="' + val(row.retards) + '" /></td>' +
-            '<td><input type="text" class="table-input" data-field="commentaire" data-row="' + row.id + '" value="' + LM.escapeHtml(row.commentaire || "") + '" placeholder="Optionnel" /></td>' +
-            '<td class="actions">' +
-              '<button type="button" class="btn btn-ghost btn-sm btn-icon" data-duprow="' + row.id + '" title="Dupliquer cette ligne (ex : 2 livreurs le même jour)">' + LM.icon("plus") + '</button>' +
-              '<button type="button" class="btn btn-ghost btn-sm btn-icon" data-delrow="' + row.id + '" title="Supprimer cette ligne">' + LM.icon("trash") + '</button>' +
-            '</td>' +
-          '</tr>';
-        }).join("");
-      }
-      body.querySelectorAll("[data-duprow]").forEach(function (btn) {
-        btn.addEventListener("click", function () {
-          syncGridFromDom();
-          var src = manualGridRows.find(function (r) { return r.id === btn.getAttribute("data-duprow"); });
-          if (!src) return;
-          manualGridRows.push({ id: DB.uid("mgr"), date: src.date, entrepotId: src.entrepotId, livreurId: null, nbLivraisons: "", nbBacs: "", km: "", retards: "", commentaire: "" });
-          renderGridBody();
-        });
-      });
-      body.querySelectorAll("[data-delrow]").forEach(function (btn) {
-        btn.addEventListener("click", function () {
-          syncGridFromDom();
-          var id = btn.getAttribute("data-delrow");
-          manualGridRows = manualGridRows.filter(function (r) { return r.id !== id; });
-          renderGridBody();
-        });
-      });
-      updateSubmitLabel();
-    }
-
-    function trySubmit() {
-      syncGridFromDom();
-      if (!manualGridRows.length) { LM.toast("Ajoutez au moins une ligne à la grille avant d'enregistrer (dates + entrepôts, puis « Générer les lignes »).", "danger"); return; }
-      clearRowErrors();
-      var invalid = manualGridRows.filter(function (row) { return row.nbLivraisons === "" || row.nbLivraisons === null || row.nbLivraisons === undefined || isNaN(Number(row.nbLivraisons)); });
-      if (invalid.length) {
-        invalid.forEach(function (row) {
-          var input = document.querySelector('[data-field="nbLivraisons"][data-row="' + row.id + '"]');
-          if (input) input.classList.add("input-error");
-        });
-        LM.toast("Merci de renseigner le nombre de livraisons sur les lignes surlignées en rouge.", "danger");
-        return;
-      }
-      var overRetard = manualGridRows.filter(function (row) {
-        var n = Number(row.retards) || 0;
-        return n > (Number(row.nbLivraisons) || 0);
-      });
-      if (overRetard.length) {
-        overRetard.forEach(function (row) {
-          var input = document.querySelector('[data-field="retards"][data-row="' + row.id + '"]');
-          if (input) input.classList.add("input-error");
-        });
-        LM.toast("Le nombre de retards ne peut pas dépasser le nombre de livraisons sur les lignes surlignées en rouge.", "danger");
-        return;
-      }
-      var records = manualGridRows.map(function (row) {
-        var liv = row.livreurId ? DB.get("livreurs", row.livreurId) : null;
-        var ent = DB.get("entrepots", row.entrepotId);
-        return {
-          date: row.date,
-          entrepotId: row.entrepotId, entrepotNom: ent ? ent.nom : null,
-          livreurId: row.livreurId || null, livreurNom: liv ? DB.livreurNomComplet(liv) : null,
-          nbLivraisons: Number(row.nbLivraisons) || 0,
-          nbBacs: Number(row.nbBacs) || 0,
-          km: Number(row.km) || 0,
-          incidents: Number(row.retards) || 0,
-          commentaire: (row.commentaire || "").toString().trim(),
-          source: "manuel"
+      frame.innerHTML = lv.entrepots.map(function (r) {
+        var ent = DB.get("entrepots", r.entrepotId);
+        var already = saisieJournalCount(day.date, lv.livreurId, r.entrepotId);
+        var armed = pendingRm === "e:" + r.uid;
+        var field = function (key, lbl, attrs) {
+          return '<label class="sm-f"><span>' + lbl + '</span><input type="number" ' + attrs + ' class="sm-num' + (r.errField === key ? ' input-error' : '') + '" data-smf="' + key + '" data-smrow="' + r.uid + '" value="' + LM.escapeHtml(r[key]) + '" /></label>';
         };
+        return '<div class="sm-ent">' +
+          '<div class="sm-ent-head"><div><span class="sm-ent-name">' + LM.escapeHtml(ent ? ent.nom : "Entrepôt supprimé") + '</span>' +
+            (already ? '<span class="badge badge-warning sm-ent-dup" title="Des livraisons existent déjà au journal pour ce livreur, cet entrepôt et cette date">Déjà ' + already + ' au journal</span>' : '') + '</div>' +
+            (armed
+              ? '<button type="button" class="sm-x sm-x-confirm" data-smentrm="' + r.uid + '">Retirer ?</button>'
+              : '<button type="button" class="sm-x" data-smentrm="' + r.uid + '" title="Retirer cet entrepôt">' + LM.icon("close") + '</button>') +
+          '</div>' +
+          '<div class="sm-ent-grid">' +
+            field("nbLivraisons", "Commandes *", 'min="0" step="1"') +
+            field("nbBacs", "Bacs", 'min="0" step="1"') +
+            field("retards", "Retards", 'min="0" step="1"') +
+            field("km", "Distance (km)", 'min="0" step="0.1"') +
+          '</div>' +
+        '</div>';
+      }).join("");
+
+      frame.querySelectorAll(".sm-num").forEach(function (inp) {
+        inp.addEventListener("input", function () {
+          var row = findRow(inp.getAttribute("data-smrow"));
+          if (!row) return;
+          row[inp.getAttribute("data-smf")] = inp.value;
+          row.errField = null;
+          inp.classList.remove("input-error");
+          disarm();
+          renderLivFrame(); renderTabs(); renderSummary();
+        });
       });
+      frame.querySelectorAll("[data-smentrm]").forEach(function (b) {
+        b.addEventListener("click", function () {
+          var id = b.getAttribute("data-smentrm");
+          var row = findRow(id);
+          if (!row) return;
+          if (saisieRowHasData(row) && pendingRm !== "e:" + id) { disarm(); pendingRm = "e:" + id; renderEntFrame(); renderSummary(); return; }
+          lv.entrepots = lv.entrepots.filter(function (x) { return x.uid !== id; });
+          disarm();
+          renderLivFrame(); renderEntFrame(); renderTabs(); renderSummary();
+        });
+      });
+    }
+
+    function findRow(rowUid) {
+      var lv = activeLivEntry();
+      if (!lv) return null;
+      for (var i = 0; i < lv.entrepots.length; i++) { if (lv.entrepots[i].uid === rowUid) return lv.entrepots[i]; }
+      return null;
+    }
+
+    function entItems() {
+      var lv = activeLivEntry();
+      if (!lv) return [];
+      var l = DB.get("livreurs", lv.livreurId);
+      var taken = {};
+      lv.entrepots.forEach(function (r) { taken[r.entrepotId] = true; });
+      return DB.list("entrepots").filter(function (e) { return !taken[e.id]; }).map(function (e) {
+        var mine = l ? DB.livreurAEntrepot(l, e.id) : false;
+        return { id: e.id, label: e.nom, sub: mine ? "Rattaché au livreur" : (e.ville || ""), mine: mine };
+      }).sort(function (a, b) {
+        if (a.mine !== b.mine) return a.mine ? -1 : 1;
+        return a.label.localeCompare(b.label, "fr");
+      });
+    }
+
+    function pickEntrepot(item) {
+      var lv = activeLivEntry();
+      if (!lv) return;
+      var row = saisieNewRow(item.id);
+      lv.entrepots.push(row);
+      disarm();
+      var inp = q("#smEntSearch");
+      inp.value = "";
+      renderLivFrame(); renderEntFrame(); renderTabs(); renderSummary();
+      var first = q('[data-smrow="' + row.uid + '"][data-smf="nbLivraisons"]');
+      if (first) { first.focus(); if (first.scrollIntoView) first.scrollIntoView({ block: "nearest" }); }
+    }
+
+    // ------------------------------------------------------------------ champ de recherche + liste
+    function bindSearch(input, drop, getItems, onPick) {
+      var shown = [], hi = 0;
+      function paint() {
+        if (!shown.length) { drop.innerHTML = '<div class="sm-drop-empty">Aucun résultat</div>'; return; }
+        drop.innerHTML = shown.map(function (it, i) {
+          return '<div class="sm-opt' + (i === hi ? ' hi' : '') + '" data-i="' + i + '"><span class="sm-opt-main">' + LM.escapeHtml(it.label) +
+            (it.warn ? ' <span class="badge badge-warning">' + LM.escapeHtml(it.warn) + '</span>' : '') + '</span>' +
+            (it.sub ? '<span class="sm-opt-sub">' + LM.escapeHtml(it.sub) + '</span>' : '') + '</div>';
+        }).join("");
+        drop.querySelectorAll("[data-i]").forEach(function (o) {
+          // mousedown (et non click) : se déclenche avant le blur du champ, qui fermerait la liste
+          o.addEventListener("mousedown", function (e) {
+            e.preventDefault();
+            choose(Number(o.getAttribute("data-i")));
+          });
+        });
+      }
+      function refresh() {
+        if (input.disabled) return;
+        var terms = smNorm(input.value).split(" ").filter(function (t) { return !!t; });
+        shown = getItems().filter(function (it) {
+          var hay = smNorm(it.label);
+          return terms.every(function (t) { return hay.indexOf(t) !== -1; });
+        });
+        if (hi >= shown.length) hi = 0;
+        paint();
+        drop.hidden = false;
+      }
+      function choose(i) {
+        var it = shown[i];
+        if (!it) return;
+        drop.hidden = true;
+        onPick(it);
+      }
+      input.addEventListener("focus", function () { hi = 0; refresh(); });
+      input.addEventListener("input", function () { hi = 0; refresh(); });
+      input.addEventListener("blur", function () { drop.hidden = true; });
+      input.addEventListener("keydown", function (e) {
+        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+          e.preventDefault();
+          if (drop.hidden) { refresh(); return; }
+          if (!shown.length) return;
+          hi = (hi + (e.key === "ArrowDown" ? 1 : shown.length - 1)) % shown.length;
+          paint();
+          var cur = drop.querySelector(".sm-opt.hi");
+          if (cur && cur.scrollIntoView) cur.scrollIntoView({ block: "nearest" });
+        } else if (e.key === "Enter") {
+          e.preventDefault();
+          if (!drop.hidden) choose(hi);
+        } else if (e.key === "Escape" && !drop.hidden) {
+          e.stopPropagation();
+          drop.hidden = true;
+        }
+      });
+    }
+
+    // ------------------------------------------------------------------ import
+    function fail(day, lv, row, field, msg) {
+      saisie.activeDate = day.date;
+      saisie.activeLiv[day.date] = lv.livreurId;
+      if (row) row.errField = field;
+      disarm();
+      renderAll();
+      if (row) {
+        var inp = q('[data-smrow="' + row.uid + '"][data-smf="' + field + '"]');
+        if (inp) { inp.focus(); if (inp.scrollIntoView) inp.scrollIntoView({ block: "nearest" }); }
+      }
+      LM.toast(msg, "danger");
+    }
+
+    function tryImport() {
+      var total = saisieTotals();
+      if (!total.ent) { LM.toast("Ajoutez au moins un livreur et un entrepôt avant d'importer.", "danger"); return; }
+      var records = [];
+      for (var i = 0; i < saisie.days.length; i++) {
+        var day = saisie.days[i];
+        for (var j = 0; j < day.livreurs.length; j++) {
+          var lv = day.livreurs[j];
+          var l = DB.get("livreurs", lv.livreurId);
+          var name = l ? DB.livreurNomComplet(l) : "Livreur supprimé";
+          if (!lv.entrepots.length) {
+            fail(day, lv, null, null, name + " n'a aucun entrepôt le " + DB.fmtDate(day.date) + " : ajoutez-en un ou retirez ce livreur.");
+            return;
+          }
+          for (var k = 0; k < lv.entrepots.length; k++) {
+            var r = lv.entrepots[k];
+            var cmd = r.nbLivraisons;
+            if (cmd === "" || isNaN(Number(cmd)) || Number(cmd) < 0) {
+              fail(day, lv, r, "nbLivraisons", "Renseignez le nombre de commandes (" + name + ", " + DB.fmtDate(day.date) + ").");
+              return;
+            }
+            var neg = ["nbBacs", "retards", "km"].filter(function (f) { return r[f] !== "" && (isNaN(Number(r[f])) || Number(r[f]) < 0); })[0];
+            if (neg) {
+              fail(day, lv, r, neg, "Valeur invalide pour " + name + " (" + DB.fmtDate(day.date) + ") : un nombre positif est attendu.");
+              return;
+            }
+            if (saisieNum(r.retards) > Number(cmd)) {
+              fail(day, lv, r, "retards", "Le nombre de retards ne peut pas dépasser le nombre de commandes (" + name + ", " + DB.fmtDate(day.date) + ").");
+              return;
+            }
+            var ent = DB.get("entrepots", r.entrepotId);
+            records.push({
+              date: day.date,
+              entrepotId: r.entrepotId, entrepotNom: ent ? ent.nom : null,
+              livreurId: lv.livreurId, livreurNom: l ? name : null,
+              nbLivraisons: Number(cmd) || 0,
+              nbBacs: saisieNum(r.nbBacs),
+              km: saisieNum(r.km),
+              incidents: saisieNum(r.retards),
+              commentaire: "",
+              source: "manuel"
+            });
+          }
+        }
+      }
+
       DB.bulkAdd("livraisons", records);
       DB.logHistorique("Analyse", "ajout", records.length > 1 ? "Ajout manuel de " + records.length + " entrées au journal des livraisons" : "Ajout manuel d'une entrée au journal des livraisons");
 
-      // Chaque ligne où "Retards" est renseigné (> 0) crée automatiquement le signalement
-      // correspondant (même mécanisme que le bouton "Gérer le retard" de la page Retards), lié à la
-      // nouvelle entrée du journal : la page Retards affiche donc immédiatement ce signalement, avec
-      // la même date/entrepôt/livreur — les clients concernés restent à préciser depuis cette page.
+      // Chaque ligne où « Retards » est renseigné (> 0) crée automatiquement le signalement
+      // correspondant (même mécanisme que « Gérer le retard » de la page Retards).
       var nbAvecRetard = 0;
       records.forEach(function (rec) {
         if (rec.incidents > 0) {
@@ -7385,11 +7935,9 @@
 
       var msg = records.length > 1 ? records.length + " entrées ajoutées au journal." : "Entrée ajoutée au journal.";
       if (nbAvecRetard) msg += " " + nbAvecRetard + " signalement(s) de retard créé(s) automatiquement.";
+      saisieReset();
+      LM.closeModal();
       LM.toast(msg, "success");
-      manualDates = [DB.todayISO()];
-      manualEntrepots = [];
-      manualLivreurs = [];
-      manualGridRows = [];
       render(document.getElementById("content"));
     }
   }
@@ -8206,7 +8754,8 @@
         '<div class="table-wrap"><table><thead><tr><th>Libellé</th><th class="num">Seuil (bacs / jour)</th><th class="num">Montant</th><th></th></tr></thead><tbody id="tiersBody"></tbody></table></div>' +
       '</div>' +
       '<div class="card">' +
-        '<div class="card-header"><div><h2>Primes par livreur</h2><p>Calcul automatique (somme des paliers atteints jour par jour) + ajustement manuel possible (bonus ou malus).</p></div></div>' +
+        '<div class="card-header"><div><h2>Primes par livreur</h2><p>Calcul automatique (somme des paliers atteints jour par jour) + ajustement manuel possible (bonus ou malus).</p></div>' +
+          '<button class="btn btn-secondary" id="btnExportPrimesXlsx">' + LM.icon("download") + ' Exporter en Excel</button></div>' +
         '<div class="table-wrap"><table><thead><tr>' +
           '<th>Livreur</th><th>Entrepôt</th><th class="num">Jours travaillés</th><th class="num">Bacs livrés</th><th class="num">Moyenne bacs/jour</th><th>Paliers atteints</th><th class="num">Prime barème</th><th class="num">Ajustement</th><th class="num">Total</th><th></th>' +
         '</tr></thead><tbody id="primesBody"></tbody></table></div>' +
@@ -8216,6 +8765,21 @@
     renderTiers();
     renderPrimesTable();
     document.getElementById("btnSimulate").addEventListener("click", openSimulation);
+    document.getElementById("btnExportPrimesXlsx").addEventListener("click", function () {
+      var rows = computeAll();
+      var data = [["Livreur", "Entrepôt", "Jours travaillés", "Bacs livrés", "Moyenne bacs/jour", "Paliers atteints", "Prime barème (€)", "Ajustements (€)", "Total (€)"]];
+      rows.forEach(function (r) {
+        var ent = r.entrepotId ? DB.get("entrepots", r.entrepotId) : null;
+        data.push([r.nom, ent ? ent.nom : "", r.nbJours, r.bacs, Math.round(r.moyenneJour * 10) / 10, r.tierLabel, r.bareme, r.ajustement, r.total]);
+      });
+      var bareme = [["Palier", "Seuil (bacs / jour)", "Montant (€)"]];
+      DB.list("primesTiers").slice().sort(function (a, b) { return a.seuilBacsJour - b.seuilBacsJour; }).forEach(function (t) { bareme.push([t.label, t.seuilBacsJour, t.montant]); });
+      XLSXLite.downloadWorkbook("primes_" + period.start + "_" + period.end + ".xlsx", [
+        { name: "Primes", rows: data, widths: [26, 22, 16, 12, 18, 34, 16, 16, 12] },
+        { name: "Barème", rows: bareme, widths: [20, 20, 14] }
+      ]);
+      LM.toast("Export Excel téléchargé.", "success");
+    });
 
     // ------------------------------------------------------------------
     // Simulation : on modifie une copie du barème et on compare, sur la période affichée, ce que
@@ -9658,6 +10222,9 @@
       var c = consecParLivreur[id];
       alertItems.push('<li><span class="badge badge-warning">Repos</span> <strong>' + LM.escapeHtml(DB.livreurNom(id) || "") + '</strong> — ' + c.run + ' jours travaillés d\'affilée (du ' + DB.fmtDate(c.debut) + ' au ' + DB.fmtDate(c.fin) + ')</li>');
     });
+    DB.congesDepasses(new Date(currentWeekStart + "T12:00:00").getFullYear()).filter(function (x) { return shownIds[x.livreur.id]; }).forEach(function (x) {
+      alertItems.push('<li><span class="badge badge-warning">Congés</span> <strong>' + LM.escapeHtml(DB.livreurNomComplet(x.livreur)) + '</strong> — ' + x.pris + ' jour(s) de ' + x.type.toUpperCase() + ' posés pour un droit de ' + x.droit + ' (' + x.exces + ' de trop)</li>');
+    });
     reposAlertes.forEach(function (a) {
       alertItems.push('<li><span class="badge badge-warning">Repos</span> <strong>' + LM.escapeHtml(DB.livreurNom(a.livreurId) || "") + '</strong> — ' + a.heures + ' h de repos avant le ' + DB.fmtDate(a.date) + ' (minimum ' + DB.getPlanningReglages().reposMinHeures + ' h)</li>');
     });
@@ -9674,6 +10241,7 @@
           entrepots.map(function (e) { return '<option value="' + e.id + '"' + (e.id === planningFilters.entrepot ? " selected" : "") + '>' + LM.escapeHtml(e.nom) + '</option>'; }).join("") +
         '</select></div>' +
         '<div class="field mb-0" style="margin-left:auto;display:flex;gap:8px;">' +
+          '<button class="btn btn-secondary" id="btnExportPlanningXlsx">' + LM.icon("download") + ' Exporter en Excel</button>' +
           '<button class="btn btn-secondary" id="btnCopyWeek" title="Reprend le planning de la semaine précédente (sans écraser les cases déjà remplies)">' + LM.icon("copy") + ' Copier la semaine précédente</button>' +
           '<button class="btn btn-pdf" id="btnExportPlanningPdf">' + LM.icon("file") + ' Exporter en PDF</button>' +
           '<button class="btn btn-wand" id="btnProposerPlanning">' + LM.icon("wand") + ' Proposer planning</button>' +
@@ -9715,6 +10283,7 @@
     document.getElementById("btnThisWeek").addEventListener("click", function () { currentWeekStart = mondayOf(DB.todayISO()); renderPlanningTab(panel); });
     document.getElementById("btnProposerPlanning").addEventListener("click", openProposerPlanningModal);
     document.getElementById("btnCopyWeek").addEventListener("click", openCopyWeekModal);
+    document.getElementById("btnExportPlanningXlsx").addEventListener("click", openExportXlsxModal);
     document.getElementById("btnExportPlanningPdf").addEventListener("click", openExportPlanningPdfModal);
 
     renderBody();
@@ -9757,6 +10326,49 @@
           var l = DB.get("livreurs", td.getAttribute("data-livreur"));
           if (l) openLivreurSummaryModal(l);
         });
+      });
+    }
+
+    // Export Excel du planning : une ligne par livreur, une colonne par jour, sur la période choisie
+    // (semaine affichée par défaut, 92 jours maximum), pour les livreurs du filtre d'entrepôt.
+    function openExportXlsxModal() {
+      LM.openModal({
+        title: "Exporter le planning en Excel",
+        bodyHtml:
+          '<div class="form-row"><div class="field"><label>Du</label><input type="date" id="xlsStart" value="' + dates[0] + '" /></div>' +
+          '<div class="field"><label>Au</label><input type="date" id="xlsEnd" value="' + weekEnd + '" /></div></div>' +
+          '<p class="text-sm text-faint">Une ligne par livreur' + (planningFilters.entrepot ? " de l'entrepôt filtré" : "") + ', une colonne par jour (92 jours maximum).</p>',
+        footerHtml: '<button class="btn btn-secondary" id="xlsCancel">Annuler</button><button class="btn btn-primary" id="xlsGo">Exporter</button>',
+        onMount: function (m) {
+          m.querySelector("#xlsCancel").addEventListener("click", LM.closeModal);
+          m.querySelector("#xlsGo").addEventListener("click", function () {
+            var st = m.querySelector("#xlsStart").value, en = m.querySelector("#xlsEnd").value;
+            if (!st || !en || st > en) { LM.toast("Plage de dates invalide.", "danger"); return; }
+            if (DB.daysBetweenIso(st, en) > 91) { LM.toast("La période ne peut pas dépasser 92 jours.", "danger"); return; }
+            var days = []; for (var d = st; d <= en; d = addDaysIso(d, 1)) days.push(d);
+            var head = ["Livreur", "Entrepôt(s)"].concat(days.map(function (d) { var dow = (new Date(d + "T12:00:00").getDay() + 6) % 7; return JOURS_SEMAINE[dow].slice(0, 3) + " " + fmtDayShort(d); })).concat(["Jours travaillés", "Heures prévues"]);
+            var rows = [head];
+            DB.list("livreurs").filter(function (l) {
+              if (l.statut === "inactif") return false;
+              if (planningFilters.entrepot && !DB.livreurAEntrepot(l, planningFilters.entrepot)) return false;
+              return !l.dateEmbauche || l.dateEmbauche <= en;
+            }).sort(function (a, b) { return DB.livreurNomComplet(a).localeCompare(DB.livreurNomComplet(b), "fr"); }).forEach(function (l) {
+              var nj = 0, heures = 0;
+              var cells = days.map(function (d) {
+                if (!DB.livreurEmbaucheLe(l, d)) return "";
+                var e = DB.planningEntreeFor(l.id, d);
+                if (!e) return "";
+                if (e.type === "travail") { nj++; heures += dureeHeures(e) || 0; return (e.heureDebut || "") + "–" + (e.heureFin || ""); }
+                return dayTypeDef(e.type).label;
+              });
+              rows.push([DB.livreurNomComplet(l), (l.entrepotIds || []).map(function (id) { return DB.entrepotNom(id); }).filter(Boolean).join(", ")].concat(cells).concat([nj, Math.round(heures * 10) / 10]));
+            });
+            if (rows.length < 2) { LM.toast("Aucun livreur à exporter.", "danger"); return; }
+            XLSXLite.downloadWorkbook("planning_" + st + "_" + en + ".xlsx", [{ name: "Planning", rows: rows, widths: [26, 24].concat(days.map(function () { return 13; })).concat([16, 14]) }]);
+            LM.closeModal();
+            LM.toast("Export Excel téléchargé.", "success");
+          });
+        }
       });
     }
 
@@ -10740,6 +11352,11 @@
           '<input type="number" name="joursAvantHeuresSup" min="0" max="7" step="1" value="' + r.joursAvantHeuresSup + '" />' +
           '<p class="text-sm text-faint" style="margin-top:4px;">Au-delà de ce nombre de jours travaillés sur une même semaine (lundi à dimanche), les jours suivants sont comptés comme heures supplémentaires dans le récapitulatif du livreur.</p>' +
         '</div>' +
+        '<h3 style="margin:22px 0 6px;">Congés (par défaut)</h3>' +
+        '<div class="form-row">' +
+          '<div class="field"><label>Droit annuel de CP (jours)</label><input type="number" name="droitCPDefaut" min="0" max="60" step="0.5" value="' + r.droitCPDefaut + '" /><div class="hint">Modifiable sur la fiche de chaque livreur. Année civile, proratisé l\'année d\'embauche.</div></div>' +
+          '<div class="field"><label>Droit annuel de RTT (jours)</label><input type="number" name="droitRTTDefaut" min="0" max="30" step="0.5" value="' + r.droitRTTDefaut + '" /><div class="hint">0 = pas de suivi des RTT.</div></div>' +
+        '</div>' +
         '<h3 style="margin:22px 0 6px;">Contrôles du planning</h3>' +
         '<div class="form-row">' +
           '<div class="field"><label>Jours travaillés consécutifs maximum</label><input type="number" name="maxJoursConsecutifs" min="0" max="14" step="1" value="' + r.maxJoursConsecutifs + '" /><div class="hint">0 = pas de contrôle. Au-delà, les cases sont signalées en rouge.</div></div>' +
@@ -10778,6 +11395,8 @@
         if (n > 0) effMin[inp.getAttribute("data-effmin")] = n;
       });
       patch.effectifMinimum = effMin;
+      patch.droitCPDefaut = Math.max(0, Math.min(60, Number(fd.get("droitCPDefaut")) || 0));
+      patch.droitRTTDefaut = Math.max(0, Math.min(30, Number(fd.get("droitRTTDefaut")) || 0));
       DB.savePlanningReglages(patch);
       LM.toast("Réglages enregistrés.", "success");
     });
