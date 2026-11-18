@@ -11480,7 +11480,7 @@
     dupIds.forEach(function (id) {
       var d = DB.get("clients", id);
       if (!d) return;
-      ["contact", "telephone", "email", "adresse", "codePostal", "ville"].forEach(function (f) {
+      ["contact", "telephone", "email", "adresse", "codePostal", "ville", "distanceKm"].forEach(function (f) {
         if (!(patch[f] || keep[f]) && d[f]) patch[f] = d[f];
       });
       if (d.notes && (keep.notes || "").indexOf(d.notes) === -1) patch.notes = ((patch.notes || keep.notes || "") + (patch.notes || keep.notes ? "\n" : "") + d.notes);
@@ -11557,6 +11557,30 @@
     });
   }
 
+  // Distance (en km) de l'adresse du client : nombre positif ou chaîne vide si non renseignée.
+  function distanceLabel(c) {
+    var v = c && c.distanceKm;
+    if (v === undefined || v === null || v === "" || isNaN(Number(v))) return "";
+    return Number(v).toLocaleString("fr-FR", { maximumFractionDigits: 2 }) + " km";
+  }
+
+  // Adresse postale complète sur une ligne (rue, code postal, ville).
+  function adresseLine(c) {
+    var cpVille = [c.codePostal, c.ville].filter(Boolean).join(" ");
+    return [c.adresse, cpVille].filter(Boolean).join(", ");
+  }
+
+  // Lit le champ « Distance (km) » d'un formulaire : null si vide ou invalide (message affiché), "" si vide.
+  function readDistance(fd) {
+    var raw = (fd.get("distanceKm") || "").toString().trim().replace(",", ".");
+    if (raw === "") return { ok: true, value: "" };
+    var n = Number(raw);
+    if (isNaN(n) || n < 0) return { ok: false };
+    return { ok: true, value: Math.round(n * 100) / 100 };
+  }
+
+  var DISTANCE_FIELD_HINT = 'Distance en kilomètres associée à l\'adresse du client.';
+
   function render(content) {
     var risks = computeRisks();
     var nbRisk = Object.keys(risks).filter(function (id) { return risks[id].niveau === "risque" && DB.get("clients", id); }).length;
@@ -11588,11 +11612,11 @@
           '</div>' +
         '</div>' +
         '<div class="form-row" style="align-items:flex-end;margin-bottom:0;">' +
-          '<div class="field mb-0" style="max-width:320px;"><label>Recherche</label><input type="search" id="clientSearch" placeholder="Nom, contact, ville…" value="' + LM.escapeHtml(searchQuery) + '" /></div>' +
+          '<div class="field mb-0" style="max-width:320px;"><label>Recherche</label><input type="search" id="clientSearch" placeholder="Nom, adresse, contact, ville…" value="' + LM.escapeHtml(searchQuery) + '" /></div>' +
           '<label class="checkbox-row mb-0" style="margin-bottom:8px;"><input type="checkbox" id="clientRiskOnly"' + (onlyRisk ? " checked" : "") + ' /> <span>Clients à risque / à surveiller uniquement</span></label>' +
         '</div>' +
         '<div class="table-wrap" style="margin-top:14px;"><table><thead><tr>' +
-          '<th>Nom</th><th>Contact</th><th>Téléphone</th><th>Ville</th><th class="num">Retards signalés</th><th></th>' +
+          '<th>Nom</th><th>Distance</th><th>Téléphone</th><th>Ville</th><th class="num">Retards signalés</th><th></th>' +
         '</tr></thead><tbody id="clientsBody"></tbody></table></div>' +
       '</div>';
 
@@ -11615,7 +11639,7 @@
       var filtered = clients.filter(function (c) {
         if (onlyRisk && !risks[c.id]) return false;
         if (!q) return true;
-        var hay = DB.normalizeStr([c.nom, c.contact, c.ville, c.email].filter(Boolean).join(" "));
+        var hay = DB.normalizeStr([c.nom, c.adresse, c.codePostal, c.contact, c.ville, c.email].filter(Boolean).join(" "));
         return hay.indexOf(q) !== -1;
       });
       var tbody = document.getElementById("clientsBody");
@@ -11623,8 +11647,9 @@
       tbody.innerHTML = filtered.map(function (c) {
         var n = retardsCountForClient(c.id);
         return '<tr>' +
-          '<td><strong>' + LM.escapeHtml(c.nom) + '</strong>' + (risks[c.id] ? ' <span class="badge ' + (risks[c.id].niveau === "risque" ? "badge-danger" : "badge-warning") + '" title="' + risks[c.id].n + ' retard(s) signalé(s) sur 90 jours">' + (risks[c.id].niveau === "risque" ? "À risque" : "À surveiller") + '</span>' : '') + '</td>' +
-          '<td class="text-sm">' + (c.contact ? LM.escapeHtml(c.contact) : '<span class="text-faint">—</span>') + '</td>' +
+          '<td><strong>' + LM.escapeHtml(c.nom) + '</strong>' + (risks[c.id] ? ' <span class="badge ' + (risks[c.id].niveau === "risque" ? "badge-danger" : "badge-warning") + '" title="' + risks[c.id].n + ' retard(s) signalé(s) sur 90 jours">' + (risks[c.id].niveau === "risque" ? "À risque" : "À surveiller") + '</span>' : '') + '' +
+          '<div class="text-sm ' + (adresseLine(c) ? 'text-muted' : 'text-faint') + '">' + (adresseLine(c) ? LM.escapeHtml(adresseLine(c)) : 'Adresse non renseignée') + '</div></td>' +
+          '<td class="text-sm" style="white-space:nowrap;">' + (distanceLabel(c) ? LM.escapeHtml(distanceLabel(c)) : '<span class="text-faint">—</span>') + '</td>' +
           '<td class="text-sm">' + (c.telephone ? LM.escapeHtml(c.telephone) : '<span class="text-faint">—</span>') + '</td>' +
           '<td class="text-sm">' + (c.ville ? LM.escapeHtml(c.ville) : '<span class="text-faint">—</span>') + '</td>' +
           '<td class="num">' + (n ? '<span class="badge badge-warning">' + n + '</span>' : '<span class="text-faint">0</span>') + '</td>' +
@@ -11681,7 +11706,7 @@
   // ------------------------------------------------------------------
   function openClientForm(existing, presetNom, onSaved) {
     var isEdit = !!existing;
-    var c = existing || { nom: presetNom || "", contact: "", telephone: "", email: "", adresse: "", codePostal: "", ville: "", notes: "" };
+    var c = existing || { nom: presetNom || "", contact: "", telephone: "", email: "", adresse: "", codePostal: "", ville: "", distanceKm: "", notes: "" };
 
     LM.openModal({
       title: isEdit ? "Modifier le client" : "Nouveau client",
@@ -11706,6 +11731,7 @@
               '<div class="field"><label>Code postal</label><input type="text" name="codePostal" value="' + LM.escapeHtml(c.codePostal) + '" /></div>' +
               '<div class="field"><label>Ville</label><input type="text" name="ville" value="' + LM.escapeHtml(c.ville) + '" /></div>' +
             '</div>' +
+            '<div class="field"><label>Distance (km)</label><input type="text" inputmode="decimal" name="distanceKm" value="' + LM.escapeHtml(c.distanceKm === undefined || c.distanceKm === null ? "" : c.distanceKm) + '" placeholder="Ex : 12,5" style="max-width:200px;" /><div class="hint">' + DISTANCE_FIELD_HINT + '</div></div>' +
             '<div class="field"><label>Notes</label><textarea name="notes">' + LM.escapeHtml(c.notes) + '</textarea></div>' +
           '</div>' +
         '</form>',
@@ -11726,6 +11752,8 @@
           var fd = new FormData(modal.querySelector("#clientForm"));
           var nom = (fd.get("nom") || "").toString().trim();
           if (!nom) { LM.toast("Le nom du client est obligatoire.", "danger"); return; }
+          var dist = readDistance(fd);
+          if (!dist.ok) { LM.toast("La distance doit être un nombre positif (en km).", "danger"); return; }
           var payload = {
             nom: nom,
             contact: (fd.get("contact") || "").toString().trim(),
@@ -11734,11 +11762,12 @@
             adresse: (fd.get("adresse") || "").toString().trim(),
             codePostal: (fd.get("codePostal") || "").toString().trim(),
             ville: (fd.get("ville") || "").toString().trim(),
+            distanceKm: dist.value,
             notes: (fd.get("notes") || "").toString().trim()
           };
           var saved = isEdit ? DB.update("clients", c.id, payload) : DB.add("clients", payload);
           if (isEdit) {
-            var changes = DB.summarizeFieldChanges(c, payload, { contact: "Contact", telephone: "Téléphone", email: "Email", adresse: "Adresse", codePostal: "Code postal", ville: "Ville" });
+            var changes = DB.summarizeFieldChanges(c, payload, { contact: "Contact", telephone: "Téléphone", email: "Email", adresse: "Adresse", codePostal: "Code postal", ville: "Ville", distanceKm: "Distance (km)" });
             DB.logHistorique("Clients", "modification", "Modification client : " + nom + (changes ? " -> " + changes : ""));
           } else {
             DB.logHistorique("Clients", "ajout", "Ajout client : " + nom);
@@ -11796,6 +11825,7 @@
                 '<div class="field"><label>Code postal</label><input type="text" name="codePostal" value="' + LM.escapeHtml(client.codePostal || "") + '" /></div>' +
                 '<div class="field"><label>Ville</label><input type="text" name="ville" value="' + LM.escapeHtml(client.ville || "") + '" /></div>' +
               '</div>' +
+              '<div class="field"><label>Distance (km)</label><input type="text" inputmode="decimal" name="distanceKm" value="' + LM.escapeHtml(client.distanceKm === undefined || client.distanceKm === null ? "" : client.distanceKm) + '" placeholder="Ex : 12,5" style="max-width:200px;" /><div class="hint">' + DISTANCE_FIELD_HINT + '</div></div>' +
               '<div class="field"><label>Notes</label><textarea name="notes">' + LM.escapeHtml(client.notes || "") + '</textarea></div>' +
               '<button type="submit" class="btn btn-primary">' + LM.icon("check") + ' Enregistrer les modifications</button>' +
             '</form>';
@@ -11804,6 +11834,8 @@
             var fd = new FormData(e.target);
             var nom = (fd.get("nom") || "").toString().trim();
             if (!nom) { LM.toast("Le nom du client est obligatoire.", "danger"); return; }
+            var dist = readDistance(fd);
+            if (!dist.ok) { LM.toast("La distance doit être un nombre positif (en km).", "danger"); return; }
             var beforeClient = client;
             var payload = {
               nom: nom,
@@ -11813,10 +11845,11 @@
               adresse: (fd.get("adresse") || "").toString().trim(),
               codePostal: (fd.get("codePostal") || "").toString().trim(),
               ville: (fd.get("ville") || "").toString().trim(),
+              distanceKm: dist.value,
               notes: (fd.get("notes") || "").toString().trim()
             };
             client = DB.update("clients", client.id, payload);
-            var changes = DB.summarizeFieldChanges(beforeClient, payload, { contact: "Contact", telephone: "Téléphone", email: "Email", adresse: "Adresse", codePostal: "Code postal", ville: "Ville" });
+            var changes = DB.summarizeFieldChanges(beforeClient, payload, { contact: "Contact", telephone: "Téléphone", email: "Email", adresse: "Adresse", codePostal: "Code postal", ville: "Ville", distanceKm: "Distance (km)" });
             DB.logHistorique("Clients", "modification", "Modification client : " + nom + (changes ? " -> " + changes : ""));
             LM.toast("Client mis à jour.", "success");
             if (typeof onChange === "function") onChange();
