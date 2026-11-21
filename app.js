@@ -9149,6 +9149,13 @@
   var selectedLivreurId = null;
   var journalPage = 1;
   var JOURNAL_PAGE_SIZE = 15;
+  // Critère de classement du cadre « 5 meilleurs / 5 pires jours » : "high" = plus c'est haut, mieux c'est.
+  var BW_CRITERIA = {
+    commandes: { label: "Commandes", field: "cmd", best: "high" },
+    bacs: { label: "Bacs", field: "bacs", best: "high" },
+    retard: { label: "Taux de retard", field: "taux", best: "low" }
+  };
+  var bwCriterion = "commandes";
 
   applyPreset("30j");
   App.registerPage("performance", { title: "Performance livreurs", subtitle: "Fiche détaillée d'activité, de primes et de matériel par livreur", render: render });
@@ -9306,12 +9313,90 @@
         profileCardHtml(liv) +
         kpiRowsHtml(rows, prevRows) +
         chartsHtml() +
+        '<div id="perfBestWorst"></div>' +
         primeCardHtml(liv) +
         vehiculeCardHtml(liv) +
         journalCardHtml();
 
       mountCharts(rows);
+      mountBestWorst(rows);
       mountJournal(rows);
+    }
+
+    // ---------------- 5 meilleurs / 5 pires jours ----------------
+    // Regroupe les entrées du livreur par jour (plusieurs entrepôts le même jour = un seul jour) et
+    // ne retient que les jours où le nombre de commandes est > 0. Les deux listes ne se recoupent
+    // jamais : s'il y a moins de 10 jours, les « pires » sont les jours restants.
+    function mountBestWorst(rows) {
+      var host = document.getElementById("perfBestWorst");
+      if (!host) return;
+      var byDay = {};
+      rows.forEach(function (r) {
+        var d = byDay[r.date];
+        if (!d) d = byDay[r.date] = { date: r.date, cmd: 0, bacs: 0, km: 0, retards: 0 };
+        d.cmd += Number(r.nbLivraisons) || 0;
+        d.bacs += Number(r.nbBacs) || 0;
+        d.km += Number(r.km) || 0;
+        var ret = DB.retardPourLivraison(r.id);
+        d.retards += ret ? (Number(ret.nbLivraisonsRetard) || 0) : 0;
+      });
+      var days = Object.keys(byDay).map(function (k) {
+        var d = byDay[k];
+        d.taux = d.cmd ? d.retards / d.cmd * 100 : 0;
+        return d;
+      }).filter(function (d) { return d.cmd > 0; });
+      var crit = BW_CRITERIA[bwCriterion] || BW_CRITERIA.commandes;
+      days.sort(function (a, b) {
+        var diff = crit.best === "high" ? (b[crit.field] - a[crit.field]) : (a[crit.field] - b[crit.field]);
+        if (diff !== 0) return diff;
+        if (b.cmd !== a.cmd) return b.cmd - a.cmd;
+        return a.date < b.date ? 1 : -1;
+      });
+      var best = days.slice(0, 5);
+      var worst = days.slice(Math.max(5, days.length - 5)).reverse();
+
+      function dayLabel(iso) {
+        var wd = new Date(iso + "T00:00:00").toLocaleDateString("fr-FR", { weekday: "short" });
+        return wd + " " + DB.fmtDate(iso);
+      }
+      function table(list, emptyMsg) {
+        if (!list.length) return '<p class="text-faint text-sm" style="margin:8px 0 0;">' + emptyMsg + '</p>';
+        return '<div class="table-wrap"><table class="bw-table"><thead><tr><th>#</th><th>Jour</th>' +
+          '<th class="num' + (crit.field === "cmd" ? ' bw-hl' : '') + '">Commandes</th>' +
+          '<th class="num' + (crit.field === "bacs" ? ' bw-hl' : '') + '">Bacs</th>' +
+          '<th class="num">Km</th>' +
+          '<th class="num' + (crit.field === "taux" ? ' bw-hl' : '') + '">Retards</th></tr></thead><tbody>' +
+          list.map(function (d, i) {
+            return '<tr><td class="text-faint">' + (i + 1) + '</td>' +
+              '<td class="text-sm" style="white-space:nowrap;">' + LM.escapeHtml(dayLabel(d.date)) + '</td>' +
+              '<td class="num' + (crit.field === "cmd" ? ' bw-hl' : '') + '">' + DB.fmtNum(d.cmd) + '</td>' +
+              '<td class="num' + (crit.field === "bacs" ? ' bw-hl' : '') + '">' + DB.fmtNum(d.bacs) + '</td>' +
+              '<td class="num">' + DB.fmtNum(Math.round(d.km)) + '</td>' +
+              '<td class="num' + (crit.field === "taux" ? ' bw-hl' : '') + '">' + DB.fmtNum(d.retards) + ' <span class="text-faint">(' + d.taux.toLocaleString("fr-FR", { maximumFractionDigits: 1 }) + ' %)</span></td></tr>';
+          }).join("") + '</tbody></table></div>';
+      }
+      var sub = crit.best === "high"
+        ? 'Jours où le livreur a eu au moins une commande, classés par <strong>' + crit.label.toLowerCase() + '</strong> (du plus élevé au plus faible).'
+        : 'Jours où le livreur a eu au moins une commande, classés par <strong>' + crit.label.toLowerCase() + '</strong> (le plus bas est le meilleur).';
+      host.innerHTML =
+        '<div class="card">' +
+          '<div class="card-header"><div><h3>5 meilleurs et 5 pires jours</h3><p class="text-sm">' + sub + '</p></div>' +
+            '<div class="flex gap-8" style="flex-wrap:wrap;">' +
+              Object.keys(BW_CRITERIA).map(function (k) {
+                return '<button type="button" class="btn btn-sm ' + (k === bwCriterion ? 'btn-primary' : 'btn-secondary') + '" data-bwcrit="' + k + '">' + BW_CRITERIA[k].label + '</button>';
+              }).join("") +
+            '</div></div>' +
+          '<div class="grid grid-2">' +
+            '<div><div class="bw-title bw-good">' + LM.icon("trend") + ' 5 meilleurs jours</div>' + table(best, "Aucun jour avec des commandes sur la période.") + '</div>' +
+            '<div><div class="bw-title bw-bad">' + LM.icon("retard") + ' 5 pires jours</div>' + table(worst, days.length ? "Pas assez de jours pour établir un classement des pires jours." : "Aucun jour avec des commandes sur la période.") + '</div>' +
+          '</div>' +
+        '</div>';
+      host.querySelectorAll("[data-bwcrit]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          bwCriterion = btn.getAttribute("data-bwcrit");
+          mountBestWorst(rows);
+        });
+      });
     }
 
     // ---------------- Profil ----------------
@@ -11415,6 +11500,7 @@
 
   var searchQuery = "";
   var onlyRisk = false;
+  var entFilter = []; // clés d'entrepôts retenues dans le filtre (vide = pas de filtre)
 
   App.registerPage("clients", { title: "Clients", subtitle: "Annuaire des clients livrés et analyse de la liste", render: render });
 
@@ -11499,8 +11585,10 @@
           (c.justifications || []).forEach(function (k) { if (j.indexOf(k) === -1 && j.length < 3) j.push(k); });
           ex.justifications = j;
           if ((Number(c.tempsRetard) || 0) > (Number(ex.tempsRetard) || 0)) ex.tempsRetard = c.tempsRetard;
+          if (!ex.heureDebut && c.heureDebut) ex.heureDebut = c.heureDebut;
+          if (!ex.heureFin && c.heureFin) ex.heureFin = c.heureFin;
         } else {
-          var copy = { clientId: id, tempsRetard: c.tempsRetard, justifications: (c.justifications || []).slice() };
+          var copy = { clientId: id, tempsRetard: c.tempsRetard, heureDebut: c.heureDebut || "", heureFin: c.heureFin || "", justifications: (c.justifications || []).slice() };
           byId[id] = copy; out.push(copy);
         }
       });
@@ -11557,11 +11645,37 @@
     });
   }
 
+  // Pour chaque client, les entrepôts où il a été signalé en retard : { clientId: { cléEntrepôt: nom } }.
+  // Le lien se fait par le journal : signalement de retard -> entrée du journal -> entrepôt.
+  function computeClientEntrepots() {
+    var map = {};
+    DB.list("retards").forEach(function (r) {
+      var liv = DB.get("livraisons", r.livraisonId);
+      if (!liv) return;
+      var key = liv.entrepotId || (liv.entrepotNom ? "nom:" + liv.entrepotNom : null);
+      if (!key) return;
+      var label = (liv.entrepotId && DB.entrepotNom(liv.entrepotId)) || liv.entrepotNom || "Entrepôt inconnu";
+      DB.retardClientIds(r).forEach(function (cid) {
+        var m = map[cid] || (map[cid] = {});
+        m[key] = label;
+      });
+    });
+    return map;
+  }
+
   // Distance (en km) de l'adresse du client : nombre positif ou chaîne vide si non renseignée.
   function distanceLabel(c) {
     var v = c && c.distanceKm;
     if (v === undefined || v === null || v === "" || isNaN(Number(v))) return "";
     return Number(v).toLocaleString("fr-FR", { maximumFractionDigits: 2 }) + " km";
+  }
+
+  // Ligne « En retard à : Entrepôt A, Entrepôt B » affichée sous le nom du client (vide si aucun retard).
+  function entrepotsLineHtml(ents) {
+    var labels = ents ? Object.keys(ents).map(function (k) { return ents[k]; }).sort(function (a, b) { return a.localeCompare(b, "fr"); }) : [];
+    if (!labels.length) return "";
+    return '<div class="cl-ents"><span class="cl-ents-label">En retard à :</span> ' +
+      labels.map(function (l) { return '<span class="cl-ent">' + LM.escapeHtml(l) + '</span>'; }).join("") + '</div>';
   }
 
   // Adresse postale complète sur une ligne (rue, code postal, ville).
@@ -11586,6 +11700,16 @@
     var nbRisk = Object.keys(risks).filter(function (id) { return risks[id].niveau === "risque" && DB.get("clients", id); }).length;
     var nbDup = findDuplicateGroups(DB.list("clients")).length;
     var clients = DB.list("clients").slice().sort(function (a, b) { return (a.nom || "").localeCompare(b.nom || ""); });
+    var clientEnts = computeClientEntrepots();
+    // Options du filtre : tous les entrepôts + ceux, hors annuaire, apparus dans le journal.
+    var entOptions = DB.list("entrepots").map(function (e) { return { key: e.id, label: e.nom }; });
+    Object.keys(clientEnts).forEach(function (cid) {
+      Object.keys(clientEnts[cid]).forEach(function (k) {
+        if (!entOptions.some(function (o) { return o.key === k; })) entOptions.push({ key: k, label: clientEnts[cid][k] });
+      });
+    });
+    entOptions.sort(function (a, b) { return a.label.localeCompare(b.label, "fr"); });
+    entFilter = entFilter.filter(function (k) { return entOptions.some(function (o) { return o.key === k; }); });
     var withRetard = clients.filter(function (c) { return retardsCountForClient(c.id) > 0; });
     var totalSignalements = DB.list("retards").reduce(function (a, r) { return a + DB.retardClientIds(r).length; }, 0);
 
@@ -11605,7 +11729,7 @@
         '<div class="card"><h3>Répartition par ville</h3><p class="text-sm">Nombre de clients par ville renseignée.</p><div id="chartVilles" style="margin-top:10px;"></div></div>' +
       '</div>' +
       '<div class="card">' +
-        '<div class="card-header"><div><h2>Liste des clients</h2><p>' + clients.length + ' client(s) enregistré(s).</p></div>' +
+        '<div class="card-header"><div><h2>Liste des clients</h2><p id="clientCountTxt">' + clients.length + ' client(s) enregistré(s).</p></div>' +
           '<div class="flex gap-8">' +
             '<button class="btn btn-secondary" id="btnDoublons">' + LM.icon("copy") + ' Doublons' + (nbDup ? ' <span class="badge badge-warning">' + nbDup + '</span>' : '') + '</button>' +
             '<button class="btn btn-primary" id="btnNewClient">' + LM.icon("plus") + ' Nouveau client</button>' +
@@ -11615,12 +11739,14 @@
           '<div class="field mb-0" style="max-width:320px;"><label>Recherche</label><input type="search" id="clientSearch" placeholder="Nom, adresse, contact, ville…" value="' + LM.escapeHtml(searchQuery) + '" /></div>' +
           '<label class="checkbox-row mb-0" style="margin-bottom:8px;"><input type="checkbox" id="clientRiskOnly"' + (onlyRisk ? " checked" : "") + ' /> <span>Clients à risque / à surveiller uniquement</span></label>' +
         '</div>' +
+        '<div class="cl-ent-filter" id="clientEntFilter"></div>' +
         '<div class="table-wrap" style="margin-top:14px;"><table><thead><tr>' +
           '<th>Nom</th><th>Distance</th><th>Téléphone</th><th>Ville</th><th class="num">Retards signalés</th><th></th>' +
         '</tr></thead><tbody id="clientsBody"></tbody></table></div>' +
       '</div>';
 
     renderCharts(clients);
+    renderEntFilter();
     renderRows();
 
     document.getElementById("btnNewClient").addEventListener("click", function () {
@@ -11634,20 +11760,52 @@
     var poClient = App.takePendingOpen("client");
     if (poClient && DB.get("clients", poClient)) openClientDetailModal(DB.get("clients", poClient), function () { render(content); });
 
+    // Filtre par entrepôt(s) : un ou plusieurs entrepôts, un client est affiché s'il a été en retard
+    // sur au moins l'un d'eux. Aucun entrepôt coché = pas de filtre.
+    function renderEntFilter() {
+      var box = document.getElementById("clientEntFilter");
+      if (!entOptions.length) { box.innerHTML = ""; return; }
+      box.innerHTML =
+        '<span class="cl-ent-filter-label">Entrepôts en retard :</span>' +
+        entOptions.map(function (o) {
+          var on = entFilter.indexOf(o.key) !== -1;
+          return '<button type="button" class="cl-chip' + (on ? ' active' : '') + '" aria-pressed="' + (on ? 'true' : 'false') + '" data-entf="' + LM.escapeHtml(o.key) + '">' + LM.escapeHtml(o.label) + '</button>';
+        }).join("") +
+        (entFilter.length ? '<button type="button" class="btn btn-ghost btn-sm" id="clientEntReset">Tout afficher</button>' : '');
+      box.querySelectorAll("[data-entf]").forEach(function (b) {
+        b.addEventListener("click", function () {
+          var k = b.getAttribute("data-entf");
+          var i = entFilter.indexOf(k);
+          if (i === -1) entFilter.push(k); else entFilter.splice(i, 1);
+          renderEntFilter();
+          renderRows();
+        });
+      });
+      var rst = document.getElementById("clientEntReset");
+      if (rst) rst.addEventListener("click", function () { entFilter = []; renderEntFilter(); renderRows(); });
+    }
+
     function renderRows() {
       var q = DB.normalizeStr(searchQuery);
       var filtered = clients.filter(function (c) {
         if (onlyRisk && !risks[c.id]) return false;
+        if (entFilter.length) {
+          var ce = clientEnts[c.id];
+          if (!ce || !entFilter.some(function (k) { return !!ce[k]; })) return false;
+        }
         if (!q) return true;
         var hay = DB.normalizeStr([c.nom, c.adresse, c.codePostal, c.contact, c.ville, c.email].filter(Boolean).join(" "));
         return hay.indexOf(q) !== -1;
       });
+      var countTxt = document.getElementById("clientCountTxt");
+      if (countTxt) countTxt.textContent = filtered.length === clients.length ? clients.length + " client(s) enregistré(s)." : filtered.length + " client(s) affiché(s) sur " + clients.length + ".";
       var tbody = document.getElementById("clientsBody");
       if (!filtered.length) { tbody.innerHTML = '<tr class="empty-row"><td colspan="6">Aucun client trouvé.</td></tr>'; return; }
       tbody.innerHTML = filtered.map(function (c) {
         var n = retardsCountForClient(c.id);
         return '<tr>' +
           '<td><strong>' + LM.escapeHtml(c.nom) + '</strong>' + (risks[c.id] ? ' <span class="badge ' + (risks[c.id].niveau === "risque" ? "badge-danger" : "badge-warning") + '" title="' + risks[c.id].n + ' retard(s) signalé(s) sur 90 jours">' + (risks[c.id].niveau === "risque" ? "À risque" : "À surveiller") + '</span>' : '') + '' +
+          entrepotsLineHtml(clientEnts[c.id]) +
           '<div class="text-sm ' + (adresseLine(c) ? 'text-muted' : 'text-faint') + '">' + (adresseLine(c) ? LM.escapeHtml(adresseLine(c)) : 'Adresse non renseignée') + '</div></td>' +
           '<td class="text-sm" style="white-space:nowrap;">' + (distanceLabel(c) ? LM.escapeHtml(distanceLabel(c)) : '<span class="text-faint">—</span>') + '</td>' +
           '<td class="text-sm">' + (c.telephone ? LM.escapeHtml(c.telephone) : '<span class="text-faint">—</span>') + '</td>' +
@@ -11864,7 +12022,7 @@
           // Détail propre à ce client (temps de retard + justificatifs) pour chaque signalement.
           var clientEntries = retards.map(function (r) {
             var ce = (r.clients || []).filter(function (c) { return c.clientId === client.id; })[0];
-            return { retard: r, tempsRetard: ce ? ce.tempsRetard : null, justifications: ce && Array.isArray(ce.justifications) ? ce.justifications : [] };
+            return { retard: r, tempsRetard: ce ? ce.tempsRetard : null, heureDebut: ce ? (ce.heureDebut || "") : "", heureFin: ce ? (ce.heureFin || "") : "", justifications: ce && Array.isArray(ce.justifications) ? ce.justifications : [] };
           });
           var tempsList = clientEntries.map(function (e) { return Number(e.tempsRetard); }).filter(function (t) { return isFinite(t) && t > 0; });
           var tempsMoyen = tempsList.length ? Math.round(tempsList.reduce(function (a, b) { return a + b; }, 0) / tempsList.length) : null;
@@ -11877,7 +12035,7 @@
             (tempsMoyen != null ?
               '<div class="grid grid-2" style="margin:0 0 14px;">' + kpiC("clock", "Temps de retard moyen", tempsMoyen + " min") + '</div>' : "") +
             (clientEntries.length ?
-              '<div class="table-wrap"><table><thead><tr><th>Date</th><th>Entrepôt</th><th class="num">Temps de retard</th><th>Justificatifs</th><th>Commentaire</th></tr></thead><tbody>' +
+              '<div class="table-wrap"><table><thead><tr><th>Date</th><th>Entrepôt</th><th class="num">Temps de retard</th><th>Créneau de commande</th><th>Justificatifs</th><th>Commentaire</th></tr></thead><tbody>' +
                 clientEntries.map(function (e) {
                   var r = e.retard;
                   var liv = DB.get("livraisons", r.livraisonId);
@@ -11886,6 +12044,7 @@
                     '<td class="text-sm">' + (liv ? DB.fmtDate(liv.date) : '<span class="text-faint">Entrée supprimée</span>') + '</td>' +
                     '<td class="text-sm">' + (liv ? LM.escapeHtml(liv.entrepotNom || DB.entrepotNom(liv.entrepotId) || "—") : "—") + '</td>' +
                     '<td class="num">' + (e.tempsRetard != null ? DB.fmtNum(e.tempsRetard) + " min" : '<span class="text-faint">—</span>') + '</td>' +
+                    '<td class="text-sm" style="white-space:nowrap;">' + ((e.heureDebut || e.heureFin) ? LM.escapeHtml((e.heureDebut || "?") + " – " + (e.heureFin || "?")) : '<span class="text-faint">—</span>') + '</td>' +
                     '<td class="text-sm">' + (justifsLabels.length ? LM.escapeHtml(justifsLabels.join(", ")) : '<span class="text-faint">—</span>') + '</td>' +
                     '<td class="text-sm">' + (r.commentaire ? LM.escapeHtml(r.commentaire) : '<span class="text-faint">—</span>') + '</td>' +
                   '</tr>';
@@ -12780,7 +12939,10 @@
                   '<div class="field"><label>Téléphone</label><input type="text" id="ncTelephone" /></div>' +
                 '</div>' +
                 '<div class="field"><label>Adresse</label><input type="text" id="ncAdresse" placeholder="N°, rue…" /></div>' +
-                '<div class="field"><label>Ville</label><input type="text" id="ncVille" /></div>' +
+                '<div class="form-row">' +
+                  '<div class="field"><label>Ville</label><input type="text" id="ncVille" /></div>' +
+                  '<div class="field"><label>Distance (km)</label><input type="text" inputmode="decimal" id="ncDistance" placeholder="Ex : 12,5" /></div>' +
+                '</div>' +
                 '<div class="flex gap-10">' +
                   '<button type="button" class="btn btn-primary btn-sm" id="btnCreateNewClient">' + LM.icon("check") + ' Créer et ajouter</button>' +
                   '<button type="button" class="btn btn-ghost btn-sm" id="btnCancelNewClient">Annuler</button>' +
@@ -12799,7 +12961,7 @@
         // Chaque client sélectionné porte son propre temps de retard (minutes) et jusqu'à 3
         // justificatifs choisis dans la liste personnalisable de la page Annexes.
         var selectedClients = (existing && Array.isArray(existing.clients)) ? existing.clients.map(function (c) {
-          return { clientId: c.clientId, tempsRetard: (c.tempsRetard != null ? c.tempsRetard : null), justifications: Array.isArray(c.justifications) ? c.justifications.slice() : [] };
+          return { clientId: c.clientId, tempsRetard: (c.tempsRetard != null ? c.tempsRetard : null), heureDebut: c.heureDebut || "", heureFin: c.heureFin || "", justifications: Array.isArray(c.justifications) ? c.justifications.slice() : [] };
         }) : [];
         renderChips();
 
@@ -12814,7 +12976,7 @@
             LM.toast("Ce client est déjà dans la liste.", "info");
             return false;
           }
-          selectedClients.unshift({ clientId: clientId, tempsRetard: null, justifications: [] });
+          selectedClients.unshift({ clientId: clientId, tempsRetard: null, heureDebut: "", heureFin: "", justifications: [] });
           renderChips();
           return true;
         }
@@ -12913,6 +13075,7 @@
             modal.querySelector("#ncTelephone").value = "";
             modal.querySelector("#ncAdresse").value = "";
             modal.querySelector("#ncVille").value = "";
+            modal.querySelector("#ncDistance").value = "";
             modal.querySelector("#retNewClientPanel").style.display = "block";
             hideClientResults();
           }
@@ -12925,6 +13088,13 @@
         modal.querySelector("#btnCreateNewClient").addEventListener("click", function () {
           var nom = modal.querySelector("#ncNom").value.toString().trim();
           if (!nom) { LM.toast("Le nom du client est obligatoire.", "danger"); return; }
+          var distRaw = modal.querySelector("#ncDistance").value.toString().trim().replace(",", ".");
+          var distKm = "";
+          if (distRaw !== "") {
+            var dn = Number(distRaw);
+            if (isNaN(dn) || dn < 0) { LM.toast("La distance doit être un nombre positif (en km).", "danger"); return; }
+            distKm = Math.round(dn * 100) / 100;
+          }
           var already = DB.resolveClientByName(nom);
           if (already) {
             addSelectedClient(already.id);
@@ -12938,6 +13108,7 @@
               adresse: modal.querySelector("#ncAdresse").value.toString().trim(),
               codePostal: "",
               ville: modal.querySelector("#ncVille").value.toString().trim(),
+              distanceKm: distKm,
               notes: ""
             });
             addSelectedClient(created.id);
@@ -12960,11 +13131,15 @@
             var maxN = Number(livraisonRow.nbLivraisons) || 0;
             if (n > maxN) { LM.toast("Le nombre de retards ne peut pas dépasser le nombre de livraisons de cette entrée (" + maxN + ").", "danger"); return; }
           }
+          if (!aucunRetard) {
+            var badHeure = selectedClients.filter(function (sc) { return sc.heureDebut && sc.heureFin && sc.heureFin <= sc.heureDebut; })[0];
+            if (badHeure) { LM.toast("L'heure de fin de commande doit être postérieure à l'heure de début (" + (DB.clientNom(badHeure.clientId) || "client") + ").", "danger"); return; }
+          }
           var patch = {
             nbLivraisonsRetard: n,
             aucunRetard: aucunRetard,
             clients: aucunRetard ? [] : selectedClients.map(function (sc) {
-              return { clientId: sc.clientId, tempsRetard: sc.tempsRetard, justifications: (sc.justifications || []).slice() };
+              return { clientId: sc.clientId, tempsRetard: sc.tempsRetard, heureDebut: sc.heureDebut || "", heureFin: sc.heureFin || "", justifications: (sc.justifications || []).slice() };
             }),
             commentaire: (fd.get("commentaire") || "").toString().trim()
           };
@@ -12994,9 +13169,19 @@
                 '<strong>' + LM.escapeHtml(nom) + '</strong>' +
                 '<button type="button" class="btn btn-ghost btn-sm btn-icon" data-rmclient="' + sc.clientId + '" title="Retirer ce client">' + LM.icon("close") + '</button>' +
               '</div>' +
-              '<div class="field mb-0" style="max-width:260px;margin-bottom:10px;">' +
-                '<label>Temps de retard (minutes)</label>' +
-                '<input type="number" min="0" data-temps="' + sc.clientId + '" value="' + (sc.tempsRetard != null ? sc.tempsRetard : "") + '" />' +
+              '<div class="form-row" style="align-items:flex-start;margin-bottom:10px;">' +
+                '<div class="field mb-0">' +
+                  '<label>Temps de retard (minutes)</label>' +
+                  '<input type="number" min="0" data-temps="' + sc.clientId + '" value="' + (sc.tempsRetard != null ? sc.tempsRetard : "") + '" />' +
+                '</div>' +
+                '<div class="field mb-0">' +
+                  '<label>Début de commande</label>' +
+                  '<input type="time" data-hdeb="' + sc.clientId + '" value="' + LM.escapeHtml(sc.heureDebut || "") + '" />' +
+                '</div>' +
+                '<div class="field mb-0">' +
+                  '<label>Fin de commande</label>' +
+                  '<input type="time" data-hfin="' + sc.clientId + '" value="' + LM.escapeHtml(sc.heureFin || "") + '" />' +
+                '</div>' +
               '</div>' +
               '<div class="field mb-0">' +
                 '<label>Justificatifs (3 maximum)</label>' +
@@ -13028,6 +13213,15 @@
               if (!sc) return;
               var v = Number(input.value);
               sc.tempsRetard = (input.value === "" || !isFinite(v) || v < 0) ? null : v;
+            });
+          });
+          [["data-hdeb", "heureDebut"], ["data-hfin", "heureFin"]].forEach(function (pair) {
+            wrap.querySelectorAll("[" + pair[0] + "]").forEach(function (input) {
+              input.addEventListener("input", function () {
+                var id = input.getAttribute(pair[0]);
+                var sc = selectedClients.filter(function (x) { return x.clientId === id; })[0];
+                if (sc) sc[pair[1]] = input.value || "";
+              });
             });
           });
           wrap.querySelectorAll("[data-add-motif]").forEach(function (btn) {
