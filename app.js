@@ -1434,6 +1434,7 @@
     clients: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8.5" cy="7.5" r="3"/><path d="M2 19.5c.8-3.4 3.2-5.3 6.5-5.3s5.7 1.9 6.5 5.3"/><circle cx="17" cy="8.3" r="2.3"/><path d="M15.6 14.4c2.2.5 3.8 2.1 4.4 4.6"/></svg>',
     historique: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/><path d="M12 8v4l3 2"/></svg>',
     copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+    move: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 9l-3 3 3 3M9 5l3-3 3 3M15 19l-3 3-3-3M19 9l3 3-3 3M2 12h20M12 2v20"/></svg>',
     moon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>',
     sun: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>',
     search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>',
@@ -10144,6 +10145,7 @@
   var activeTab = "planning";
   var currentWeekStart = mondayOf(DB.todayISO());
   var planningFilters = { entrepot: "" };
+  var planUndo = null; // dernière opération de glisser-déposer annulable : { message, restore: [...] }
   var histFilters = { q: "", type: "" };
 
   App.registerPage("planning", { title: "Planning", subtitle: "Planning hebdomadaire, demandes d'absence et réglages", render: render });
@@ -10338,6 +10340,7 @@
         '<span class="week-nav-label">Semaine du ' + DB.fmtDate(currentWeekStart) + ' au ' + DB.fmtDate(weekEnd) + '</span>' +
         '<button class="btn btn-secondary btn-sm btn-icon" id="btnNextWeek" title="Semaine suivante">' + LM.icon("chevronRight") + '</button>' +
       '</div>' +
+      (planUndo ? '<div class="pln-undo" id="plnUndo"><span>' + LM.escapeHtml(planUndo.message) + '</span><button type="button" class="btn btn-secondary btn-sm" id="btnPlnUndo">Annuler</button><button type="button" class="btn btn-ghost btn-sm btn-icon" id="btnPlnUndoClose" title="Fermer">' + LM.icon("close") + '</button></div>' : '') +
       (alertItems.length ? '<div class="pln-alerts"><div class="pln-alerts-title">' + LM.icon("alert") + ' ' + alertItems.length + ' point' + (alertItems.length > 1 ? "s" : "") + ' d\'attention cette semaine</div><ul>' + alertItems.join("") + '</ul></div>' : '') +
       '<div class="planning-scroll"><table class="planning-table">' +
         '<thead>' +
@@ -10362,10 +10365,10 @@
         '<span class="planning-legend-item"><span class="planning-legend-swatch sw-prehire"></span>Avant l\'embauche <span class="text-faint">(non modifiable)</span></span>' +
       '</div>';
 
-    document.getElementById("plnEnt").addEventListener("change", function (e) { planningFilters.entrepot = e.target.value; renderPlanningTab(panel); });
-    document.getElementById("btnPrevWeek").addEventListener("click", function () { currentWeekStart = addDaysIso(currentWeekStart, -7); renderPlanningTab(panel); });
-    document.getElementById("btnNextWeek").addEventListener("click", function () { currentWeekStart = addDaysIso(currentWeekStart, 7); renderPlanningTab(panel); });
-    document.getElementById("btnThisWeek").addEventListener("click", function () { currentWeekStart = mondayOf(DB.todayISO()); renderPlanningTab(panel); });
+    document.getElementById("plnEnt").addEventListener("change", function (e) { planUndo = null; planningFilters.entrepot = e.target.value; renderPlanningTab(panel); });
+    document.getElementById("btnPrevWeek").addEventListener("click", function () { planUndo = null; currentWeekStart = addDaysIso(currentWeekStart, -7); renderPlanningTab(panel); });
+    document.getElementById("btnNextWeek").addEventListener("click", function () { planUndo = null; currentWeekStart = addDaysIso(currentWeekStart, 7); renderPlanningTab(panel); });
+    document.getElementById("btnThisWeek").addEventListener("click", function () { planUndo = null; currentWeekStart = mondayOf(DB.todayISO()); renderPlanningTab(panel); });
     document.getElementById("btnProposerPlanning").addEventListener("click", openProposerPlanningModal);
     document.getElementById("btnCopyWeek").addEventListener("click", openCopyWeekModal);
     document.getElementById("btnExportPlanningXlsx").addEventListener("click", openExportXlsxModal);
@@ -10373,6 +10376,24 @@
 
     renderBody();
     renderSummaryRow();
+
+    var btnUndo = document.getElementById("btnPlnUndo");
+    if (btnUndo) {
+      btnUndo.addEventListener("click", function () {
+        var u = planUndo;
+        planUndo = null;
+        if (u) {
+          u.restore.forEach(function (r) {
+            if (r.snap) DB.bulkUpsertPlanningEntree([{ livreurId: r.livreurId, date: r.date, patch: r.snap }]);
+            else DB.removePlanningEntree(r.livreurId, r.date);
+          });
+          DB.logHistorique("Planning", "modification", "Annulation : " + u.message);
+          LM.toast("Modification annulée.", "success");
+        }
+        renderPlanningTab(panel);
+      });
+      document.getElementById("btnPlnUndoClose").addEventListener("click", function () { planUndo = null; renderPlanningTab(panel); });
+    }
 
     // Ligne "Effectif du jour" isolée dans sa propre fonction (plutôt que calculée une seule
     // fois dans le HTML initial du thead) : on peut ainsi la rafraîchir après CHAQUE
@@ -10394,17 +10415,19 @@
       tbody.innerHTML = livreurs.map(function (l) {
         var initials = ((l.prenom || "?")[0] + (l.nom || "?")[0]).toUpperCase();
         return '<tr class="planning-row">' +
-          '<td class="planning-livreur-col" data-livreur="' + l.id + '" title="Voir le récapitulatif de ' + LM.escapeHtml(DB.livreurNomComplet(l)) + '"><div class="flex gap-10" style="align-items:center;"><span class="avatar">' + initials + '</span><strong>' + LM.escapeHtml(DB.livreurNomComplet(l)) + '</strong></div></td>' +
+          '<td class="planning-livreur-col" data-livreur="' + l.id + '" title="Voir le récapitulatif de ' + LM.escapeHtml(DB.livreurNomComplet(l)) + '"><div class="flex gap-10" style="align-items:center;"><span class="avatar">' + initials + '</span><div class="pln-liv-info"><strong>' + LM.escapeHtml(DB.livreurNomComplet(l)) + '</strong>' + livreurPillsHtml(l) + '</div></div></td>' +
           dates.map(function (d) { return planningCellHtml(l, d); }).join("") +
         '</tr>';
       }).join("");
 
       tbody.querySelectorAll("[data-cell]").forEach(function (td) {
         td.addEventListener("click", function () {
+          if (dndSuppressClick) return; // fin d'un glisser-déposer : ne pas ouvrir la fiche de la case
           var parts = td.getAttribute("data-cell").split("|");
           openDayForm(DB.get("livreurs", parts[0]), parts[1]);
         });
       });
+      if (!tbody._dndReady) { tbody._dndReady = true; setupDragAndDrop(tbody); }
 
       tbody.querySelectorAll("[data-livreur]").forEach(function (td) {
         td.addEventListener("click", function () {
@@ -10412,6 +10435,190 @@
           if (l) openLivreurSummaryModal(l);
         });
       });
+    }
+
+    // ------------------------------------------------------------------
+    // Glisser-déposer d'une case : on appuie sur une case remplie et on la fait glisser (souris :
+    // dès qu'on bouge ; écran tactile : appui long). La case survolée se scinde alors en deux moitiés,
+    // « Déplacer » (gauche) et « Dupliquer » (droite) : on relâche sur la moitié voulue. Dans les deux
+    // cas la case cible reçoit la journée (type, horaires, pause, commentaire) : le livreur et le
+    // jour sont mis à jour. « Déplacer » vide ensuite la case d'origine. Un bandeau « Annuler »
+    // permet de revenir en arrière (la case cible écrasée est alors restaurée). Échap annule le geste.
+    var dndSuppressClick = false;
+
+    function setupDragAndDrop(tbody) {
+      var st = null;
+
+      function cellKey(td) { return td.getAttribute("data-cell"); }
+
+      tbody.addEventListener("pointerdown", function (e) {
+        if (e.pointerType === "mouse" && e.button !== 0) return;
+        var td = e.target.closest ? e.target.closest("td[data-cell][data-has-entry]") : null;
+        if (!td) return;
+        st = { td: td, x: e.clientX, y: e.clientY, lastX: e.clientX, lastY: e.clientY, started: false, touch: e.pointerType !== "mouse", timer: null, scrollTimer: null, hover: null, act: null, ghost: null, offX: 0, offY: 0 };
+        if (st.touch) {
+          st.timer = setTimeout(function () { if (st && !st.started) startDrag(); }, 350);
+        }
+        document.addEventListener("pointermove", onMove);
+        document.addEventListener("pointerup", onUp);
+        document.addEventListener("pointercancel", onCancel);
+        document.addEventListener("keydown", onKey);
+        document.addEventListener("contextmenu", onCtx);
+        document.addEventListener("touchmove", onTouchMove, { passive: false });
+      });
+
+      function onCtx(e) { if (st && st.started) e.preventDefault(); }
+      function onTouchMove(e) { if (st && st.started) e.preventDefault(); }
+      function onKey(e) { if (e.key === "Escape" && st) { cleanup(true); } }
+
+      function startDrag() {
+        var rect = st.td.getBoundingClientRect();
+        var ghost = document.createElement("div");
+        ghost.className = "pln-ghost " + st.td.className.replace(/pln-warn|pln-drop-target|pln-drag-src/g, "");
+        ghost.style.width = Math.min(rect.width, 96) + "px";
+        ghost.innerHTML = st.td.innerHTML;
+        document.body.appendChild(ghost);
+        st.ghost = ghost;
+        st.offX = -16; // la pastille flotte en bas à droite du pointeur pour ne pas masquer la case survolée
+        st.offY = -16;
+        st.started = true;
+        st.td.classList.add("pln-drag-src");
+        document.body.classList.add("pln-dragging");
+        if (window.getSelection) window.getSelection().removeAllRanges();
+        // Défilement automatique de la page quand le pointeur approche du haut ou du bas.
+        st.scrollTimer = setInterval(function () {
+          if (!st) return;
+          var dy = st.lastY < 70 ? -14 : (st.lastY > window.innerHeight - 70 ? 14 : 0);
+          if (dy) { window.scrollBy(0, dy); updateHover(); }
+        }, 30);
+        moveGhost();
+        updateHover();
+      }
+
+      function moveGhost() {
+        if (!st || !st.ghost) return;
+        st.ghost.style.left = (st.lastX - st.offX) + "px";
+        st.ghost.style.top = (st.lastY - st.offY) + "px";
+      }
+
+      function onMove(e) {
+        if (!st) return;
+        st.lastX = e.clientX; st.lastY = e.clientY;
+        if (!st.started) {
+          var dist = Math.sqrt(Math.pow(e.clientX - st.x, 2) + Math.pow(e.clientY - st.y, 2));
+          if (st.touch) { if (dist > 8) cleanup(false); return; } // le doigt bouge avant l'appui long : c'est un défilement
+          if (dist > 5) startDrag();
+          return;
+        }
+        moveGhost();
+        updateHover();
+      }
+
+      function clearSplit(td) {
+        if (!td) return;
+        td.classList.remove("pln-drop-target");
+        var sp = td.querySelector(".pln-split");
+        if (sp) sp.remove();
+      }
+
+      function updateHover() {
+        if (!st || !st.started) return;
+        var el = document.elementFromPoint(st.lastX, st.lastY);
+        var td = el && el.closest ? el.closest("td[data-cell]") : null;
+        if (td && !tbody.contains(td)) td = null;
+        if (td === st.td) td = null;
+        if (td !== st.hover) {
+          clearSplit(st.hover);
+          st.hover = td;
+          if (td) {
+            td.classList.add("pln-drop-target");
+            var sp = document.createElement("div");
+            sp.className = "pln-split";
+            sp.innerHTML =
+              '<div class="pln-split-half pln-split-move" data-act="move">' + LM.icon("move") + '<span>Déplacer</span></div>' +
+              '<div class="pln-split-half pln-split-dup" data-act="dup">' + LM.icon("copy") + '<span>Dupliquer</span></div>';
+            td.appendChild(sp);
+          }
+        }
+        if (st.hover) {
+          var r = st.hover.getBoundingClientRect();
+          st.act = st.lastX < r.left + r.width / 2 ? "move" : "dup";
+          st.hover.querySelectorAll(".pln-split-half").forEach(function (h) { h.classList.toggle("hot", h.getAttribute("data-act") === st.act); });
+        } else {
+          st.act = null;
+        }
+      }
+
+      function onUp() {
+        if (!st) return;
+        var s = st;
+        var wasDrag = s.started;
+        var target = s.hover, act = s.act;
+        var srcKey = cellKey(s.td), tgtKey = target ? cellKey(target) : null;
+        cleanup(false);
+        if (!wasDrag) return;
+        dndSuppressClick = true;
+        setTimeout(function () { dndSuppressClick = false; }, 60);
+        if (tgtKey && act) performDrop(srcKey, tgtKey, act);
+      }
+
+      function onCancel() { if (st) cleanup(true); }
+
+      function cleanup(suppress) {
+        if (!st) return;
+        var s = st; st = null;
+        if (s.timer) clearTimeout(s.timer);
+        if (s.scrollTimer) clearInterval(s.scrollTimer);
+        clearSplit(s.hover);
+        if (s.ghost) s.ghost.remove();
+        s.td.classList.remove("pln-drag-src");
+        document.body.classList.remove("pln-dragging");
+        document.removeEventListener("pointermove", onMove);
+        document.removeEventListener("pointerup", onUp);
+        document.removeEventListener("pointercancel", onCancel);
+        document.removeEventListener("keydown", onKey);
+        document.removeEventListener("contextmenu", onCtx);
+        document.removeEventListener("touchmove", onTouchMove, { passive: false });
+        if (suppress && s.started) {
+          dndSuppressClick = true;
+          setTimeout(function () { dndSuppressClick = false; }, 60);
+        }
+      }
+
+      function snapOf(e) {
+        return e ? { type: e.type, heureDebut: e.heureDebut || "", heureFin: e.heureFin || "", pauseDuree: e.pauseDuree || 0, commentaire: e.commentaire || "", fromDemande: !!e.fromDemande } : null;
+      }
+
+      function performDrop(srcKey, tgtKey, act) {
+        var sp = srcKey.split("|"), tp = tgtKey.split("|");
+        var src = DB.planningEntreeFor(sp[0], sp[1]);
+        if (!src) return;
+        var tgtLiv = DB.get("livreurs", tp[0]), srcLiv = DB.get("livreurs", sp[0]);
+        if (!tgtLiv || !srcLiv) return;
+        if (!DB.livreurEmbaucheLe(tgtLiv, tp[1])) { LM.toast("Ce livreur n'est pas encore embauché à cette date.", "danger"); return; }
+        var srcSnap = snapOf(src), tgtSnap = snapOf(DB.planningEntreeFor(tp[0], tp[1]));
+        // La journée copiée devient une saisie manuelle : plus de lien avec une demande d'absence.
+        var patch = { type: srcSnap.type, heureDebut: srcSnap.heureDebut, heureFin: srcSnap.heureFin, pauseDuree: srcSnap.pauseDuree, commentaire: srcSnap.commentaire, fromDemande: false };
+        var res = DB.bulkUpsertPlanningEntree([{ livreurId: tp[0], date: tp[1], patch: patch }]);
+        if (!res.saved) { LM.toast("Enregistrement impossible (espace de stockage local insuffisant).", "danger"); return; }
+        if (act === "move") DB.removePlanningEntree(sp[0], sp[1]);
+        var label = dayTypeDef(srcSnap.type).label;
+        var from = DB.livreurNomComplet(srcLiv) + " (" + DB.fmtDate(sp[1]) + ")";
+        var to = DB.livreurNomComplet(tgtLiv) + " (" + DB.fmtDate(tp[1]) + ")";
+        var message = (act === "move" ? "Journée « " + label + " » déplacée de " : "Journée « " + label + " » dupliquée de ") + from + " vers " + to + (tgtSnap ? " — l'ancienne case a été remplacée" : "");
+        planUndo = {
+          message: message,
+          restore: act === "move"
+            ? [{ livreurId: tp[0], date: tp[1], snap: tgtSnap }, { livreurId: sp[0], date: sp[1], snap: srcSnap }]
+            : [{ livreurId: tp[0], date: tp[1], snap: tgtSnap }]
+        };
+        DB.logHistorique("Planning", "modification", message);
+        LM.toast(act === "move" ? "Journée déplacée." : "Journée dupliquée.", "success");
+        // Rafraîchissement complet (grille, bulles, effectifs, alertes), en gardant la position de défilement.
+        var scrollY = window.scrollY;
+        renderPlanningTab(panel);
+        window.scrollTo(0, scrollY);
+      }
     }
 
     // Export Excel du planning : une ligne par livreur, une colonne par jour, sur la période choisie
@@ -10520,7 +10727,7 @@
       if (entry && entry.commentaire) titleParts.push(entry.commentaire);
       if (isDemande) titleParts.push("Issu d'une demande d'absence");
       var title = titleParts.length ? ' title="' + LM.escapeHtml(titleParts.join(" — ")) + '"' : "";
-      return '<td class="planning-cell ' + cls + '" data-cell="' + l.id + '|' + dateIso + '"' + title + '><div class="planning-cell-inner"' + styleAttr + '>' + inner + '</div></td>';
+      return '<td class="planning-cell ' + cls + '" data-cell="' + l.id + '|' + dateIso + '"' + (entry ? ' data-has-entry="1"' : '') + title + '><div class="planning-cell-inner"' + styleAttr + '>' + inner + '</div></td>';
     }
 
     // ------------------------------------------------------------------
@@ -10565,10 +10772,35 @@
         (pillsHtml ? '<div class="psum-pills">' + pillsHtml + '</div>' : "") +
       '</th>';
     }
+    // Bulles de la colonne « Livreur » : mêmes pastilles colorées que la ligne « Effectif du jour »,
+    // mais comptées pour CE livreur sur la semaine affichée (jours de travail, repos, CP, RTT…).
+    function livreurPillsHtml(l) {
+      var travail = 0, repos = 0, others = {};
+      dates.forEach(function (d) {
+        if (!DB.livreurEmbaucheLe(l, d)) return;
+        var e = DB.planningEntreeFor(l.id, d);
+        if (!e) return;
+        if (e.type === "travail") travail++;
+        else if (e.type === "repos") repos++;
+        else others[e.type] = (others[e.type] || 0) + 1;
+      });
+      var html = "";
+      if (travail > 0) html += psumPill("travail", travail, FIXED_TYPES.travail.label, null);
+      if (repos > 0) html += psumPill("repos", repos, FIXED_TYPES.repos.label, null);
+      var seen = {};
+      absenceTypes().forEach(function (it) {
+        if (others[it.key]) { html += psumPill(it.key, others[it.key], it.label, it.color); seen[it.key] = true; }
+      });
+      Object.keys(others).forEach(function (k) {
+        if (!seen[k]) html += psumPill(k, others[k], dayTypeDef(k).label, FALLBACK_COLOR);
+      });
+      return html ? '<div class="psum-pills pln-liv-pills">' + html + '</div>' : "";
+    }
+
     function psumPill(key, count, label, color) {
       // "repos" garde sa classe CSS fixe ; tout type d'absence est coloré en style inline à
       // partir de sa couleur (personnalisable depuis Annexes).
-      var cls = key === "repos" ? "psum-pill psum-repos" : "psum-pill";
+      var cls = key === "repos" ? "psum-pill psum-repos" : (key === "travail" ? "psum-pill psum-travail" : "psum-pill");
       var styleAttr = color ? ' style="background:' + colorTint(color, 0.16) + ';color:' + LM.escapeHtml(color) + ';"' : "";
       return '<span class="' + cls + '"' + styleAttr + ' title="' + LM.escapeHtml(count + " " + label) + '">' + count + '</span>';
     }

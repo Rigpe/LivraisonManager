@@ -1358,3 +1358,24 @@ kbd { display: inline-block; padding: 1px 6px; border: 1px solid var(--color-bor
 .cl-chip { cursor: pointer; font: inherit; font-size: 0.78rem; font-weight: 650; padding: 5px 12px; border-radius: 100px; border: 1px solid var(--color-border-strong); background: var(--color-surface); color: var(--color-text); transition: background var(--transition), border-color var(--transition); }
 .cl-chip:hover { border-color: var(--color-primary); }
 .cl-chip.active { background: var(--color-primary); border-color: var(--color-primary); color: #fff; }
+
+/* ---------------------------------------------------------------------- */
+/* Planning : glisser-déposer, bulles de la colonne livreur                */
+/* ---------------------------------------------------------------------- */
+.planning-cell[data-has-entry] { cursor: grab; }
+body.pln-dragging, body.pln-dragging * { cursor: grabbing !important; user-select: none !important; -webkit-user-select: none !important; }
+.planning-cell.pln-drag-src .planning-cell-inner { opacity: 0.35; }
+.pln-ghost { position: fixed; z-index: 300; pointer-events: none; padding: 4px !important; min-width: 0 !important; opacity: 0.88; transform: scale(0.9); transform-origin: top left; text-align: center; filter: drop-shadow(0 8px 14px rgba(20, 25, 45, 0.28)); }
+.planning-cell.pln-drop-target { position: relative; }
+.planning-cell.pln-drop-target .planning-cell-inner { transform: none; filter: none; }
+.pln-split { position: absolute; inset: 4px; display: flex; gap: 3px; z-index: 5; }
+.pln-split-half { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; border-radius: 7px; color: #fff; font-size: 0.62rem; font-weight: 700; line-height: 1.1; opacity: 0.72; transition: opacity 80ms ease, transform 80ms ease; }
+.pln-split-half svg { width: 14px; height: 14px; display: block; }
+.pln-split-move { background: var(--color-primary); }
+.pln-split-dup { background: #0d8f80; }
+.pln-split-half.hot { opacity: 1; transform: scale(1.04); box-shadow: 0 0 0 2px #fff, 0 2px 8px rgba(20, 25, 45, 0.35); }
+.pln-undo { display: flex; align-items: center; gap: 12px; margin: 0 0 14px; padding: 10px 14px; border-radius: var(--radius-md); background: var(--color-info-light); color: var(--color-info); font-size: 0.84rem; font-weight: 600; }
+.pln-undo > span { flex: 1; }
+.pln-liv-info { display: flex; flex-direction: column; align-items: flex-start; min-width: 0; }
+.pln-liv-pills { justify-content: flex-start; margin-top: 4px; }
+.psum-travail { background: var(--color-success-light); color: var(--color-success); }
