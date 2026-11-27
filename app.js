@@ -1702,6 +1702,71 @@
     return win;
   }
 
+  // Champ de recherche avec liste déroulante, partagé par les pop-up « façon saisie manuelle »
+  // (demande d'absence, gestion des retards). getItems(texteSaisi) renvoie [{ id, label, sub, warn }] ;
+  // opts.extra(texteSaisi) peut ajouter des lignes toujours proposées (ex : « Créer ce client »).
+  // onPick(item) est appelé au clic ou sur Entrée ; la liste se ferme, au demandeur de vider le champ.
+  function searchDrop(input, drop, getItems, onPick, opts) {
+    opts = opts || {};
+    var shown = [], hi = 0;
+    function norm(str) {
+      if (!str) return "";
+      return str.toString().trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ");
+    }
+    function paint() {
+      if (!shown.length) { drop.innerHTML = '<div class="sm-drop-empty">Aucun résultat</div>'; return; }
+      drop.innerHTML = shown.map(function (it, i) {
+        return '<div class="sm-opt' + (i === hi ? ' hi' : '') + (it.extra ? ' sm-opt-extra' : '') + '" data-i="' + i + '"><span class="sm-opt-main">' + escapeHtml(it.label) +
+          (it.warn ? ' <span class="badge badge-warning">' + escapeHtml(it.warn) + '</span>' : '') + '</span>' +
+          (it.sub ? '<span class="sm-opt-sub">' + escapeHtml(it.sub) + '</span>' : '') + '</div>';
+      }).join("");
+      drop.querySelectorAll("[data-i]").forEach(function (o) {
+        // mousedown (et non click) : se déclenche avant le blur du champ, qui fermerait la liste
+        o.addEventListener("mousedown", function (e) { e.preventDefault(); choose(Number(o.getAttribute("data-i"))); });
+      });
+    }
+    function refresh() {
+      if (input.disabled) return;
+      var raw = input.value;
+      var terms = norm(raw).split(" ").filter(function (t) { return !!t; });
+      shown = getItems(raw).filter(function (it) {
+        var hay = norm(it.label + " " + (it.hay || ""));
+        return terms.every(function (t) { return hay.indexOf(t) !== -1; });
+      });
+      if (opts.extra) shown = shown.concat(opts.extra(raw) || []);
+      if (hi >= shown.length) hi = 0;
+      paint();
+      drop.hidden = false;
+    }
+    function choose(i) {
+      var it = shown[i];
+      if (!it) return;
+      drop.hidden = true;
+      onPick(it);
+    }
+    input.addEventListener("focus", function () { hi = 0; refresh(); });
+    input.addEventListener("input", function () { hi = 0; refresh(); });
+    input.addEventListener("blur", function () { drop.hidden = true; });
+    input.addEventListener("keydown", function (e) {
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        if (drop.hidden) { refresh(); return; }
+        if (!shown.length) return;
+        hi = (hi + (e.key === "ArrowDown" ? 1 : shown.length - 1)) % shown.length;
+        paint();
+        var cur = drop.querySelector(".sm-opt.hi");
+        if (cur && cur.scrollIntoView) cur.scrollIntoView({ block: "nearest" });
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        if (!drop.hidden) choose(hi);
+      } else if (e.key === "Escape" && !drop.hidden) {
+        e.stopPropagation();
+        drop.hidden = true;
+      }
+    });
+    return { refresh: refresh };
+  }
+
   global.LM = {
     ICONS: ICONS,
     icon: icon,
@@ -1711,7 +1776,8 @@
     openModal: openModal,
     closeModal: closeModal,
     confirmDialog: confirmDialog,
-    printReport: printReport
+    printReport: printReport,
+    searchDrop: searchDrop
   };
 })(typeof window !== "undefined" ? window : globalThis);
 
@@ -6520,6 +6586,7 @@
         '</div>' +
       '</div>' +
       '<div class="grid grid-4" id="kpiRow" style="margin-bottom:22px;"></div>' +
+      '<div id="punctRow"></div>' +
       '<div class="grid grid-2">' +
         '<div class="card"><h3>Livraisons par jour</h3><p class="text-sm">Évolution sur la période sélectionnée.</p><div id="chartLine" style="margin-top:10px;"></div></div>' +
         '<div class="card"><h3>Livraisons &amp; bacs par entrepôt</h3><p class="text-sm">Comparaison entre sites.</p><div id="chartBarEnt" style="margin-top:10px;"></div></div>' +
@@ -6639,6 +6706,26 @@
       kpi("box", "Bacs livrés", DB.fmtNum(nbBacs), trendHtml(nbBacs, prevBacs)) +
       kpi("zones", "Kilomètres parcourus", DB.fmtNum(Math.round(km)), trendHtml(km, prevKm)) +
       kpi("alert", "Incidents signalés", DB.fmtNum(incidents), trendHtml(incidents, prevIncidents));
+    renderPunctuality(rows);
+  }
+
+  // Bandeau « Ponctualité » sous les KPI : répartition en avance / à l'heure / en retard des commandes
+  // dont la ponctualité a été renseignée (saisie manuelle ou fiche d'entrée). Masqué sans donnée.
+  function renderPunctuality(rows) {
+    var host = document.getElementById("punctRow");
+    if (!host) return;
+    var pr = rows.filter(function (r) { return r.nbEnAvance != null || r.nbALHeure != null; });
+    var avance = sumField(pr, "nbEnAvance"), alh = sumField(pr, "nbALHeure"), ret = sumRetard(pr);
+    var total = avance + alh + ret;
+    if (!total) { host.innerHTML = ""; return; }
+    var pct = function (n) { return Math.round(n / total * 1000) / 10; };
+    var seg = function (cls, n) { return n ? '<span class="punct-seg ' + cls + '" style="flex:' + n + ';" title="' + n + '"></span>' : ""; };
+    var leg = function (cls, label, n) { return '<span class="punct-leg"><span class="punct-dot ' + cls + '"></span>' + label + ' <strong>' + DB.fmtNum(n) + '</strong> <span class="text-faint">(' + pct(n).toLocaleString("fr-FR") + ' %)</span></span>'; };
+    host.innerHTML = '<div class="card punct-card">' +
+      '<div class="punct-head"><h3>Ponctualité des commandes</h3><span class="text-sm text-faint">sur ' + DB.fmtNum(total) + ' commande' + (total > 1 ? 's' : '') + ' classée' + (total > 1 ? 's' : '') + ' (' + pr.length + ' entrée' + (pr.length > 1 ? 's' : '') + ')</span></div>' +
+      '<div class="punct-bar">' + seg("punct-early", avance) + seg("punct-ontime", alh) + seg("punct-late", ret) + '</div>' +
+      '<div class="punct-legend">' + leg("punct-early", "En avance", avance) + leg("punct-ontime", "À l\'heure", alh) + leg("punct-late", "En retard", ret) + '</div>' +
+    '</div>';
   }
 
   // ------------------------------------------------------------------
@@ -6707,11 +6794,11 @@
   function exportAnalyseXlsx() {
     var rows = livraisonsInRange(period.start, period.end).slice().sort(function (a, b) { return a.date.localeCompare(b.date); });
     if (!rows.length) { LM.toast("Aucune livraison sur cette période à exporter.", "danger"); return; }
-    var journal = [["Date", "Entrepôt", "Livreur", "Livraisons", "Bacs", "Km", "Retards signalés", "Incidents", "Client", "Adresse", "Code postal", "Ville", "Tournée", "Séquence", "Source", "Commentaire"]];
+    var journal = [["Date", "Entrepôt", "Livreur", "Livraisons", "Bacs", "Km", "En avance", "À l'heure", "Retards signalés", "Incidents", "Client", "Adresse", "Code postal", "Ville", "Tournée", "Séquence", "Source", "Commentaire"]];
     var byEnt = {}, byLiv = {};
     rows.forEach(function (r) {
       var ret = sumRetard([r]);
-      journal.push([r.date, entrepotLabel(r), livreurLabel(r), Number(r.nbLivraisons) || 0, Number(r.nbBacs) || 0, Number(r.km) || 0, ret, Number(r.incidents) || 0, r.client || "", r.adresse || "", r.codePostal || "", r.ville || "", r.tournee || "", r.sequence || "", r.source || "", r.commentaire || ""]);
+      journal.push([r.date, entrepotLabel(r), livreurLabel(r), Number(r.nbLivraisons) || 0, Number(r.nbBacs) || 0, Number(r.km) || 0, r.nbEnAvance != null ? Number(r.nbEnAvance) || 0 : "", r.nbALHeure != null ? Number(r.nbALHeure) || 0 : "", ret, Number(r.incidents) || 0, r.client || "", r.adresse || "", r.codePostal || "", r.ville || "", r.tournee || "", r.sequence || "", r.source || "", r.commentaire || ""]);
       var ke = entrepotKey(r), kl = livreurKey(r);
       var e = byEnt[ke] = byEnt[ke] || { label: entrepotLabel(r), liv: 0, bacs: 0, km: 0, ret: 0 };
       var l = byLiv[kl] = byLiv[kl] || { label: livreurLabel(r), liv: 0, bacs: 0, km: 0, ret: 0, days: {} };
@@ -7358,7 +7445,7 @@
   }
 
   function saisieNewRow(entrepotId) {
-    return { uid: DB.uid("sme"), entrepotId: entrepotId, nbLivraisons: "", nbBacs: "", retards: "", km: "", errField: null };
+    return { uid: DB.uid("sme"), entrepotId: entrepotId, nbLivraisons: "", nbBacs: "", nbEnAvance: "", nbALHeure: "", retards: "", km: "", errField: null };
   }
 
   function saisieFindLiv(day, livId) {
@@ -7374,7 +7461,7 @@
   }
 
   function saisieRowHasData(r) {
-    return r.nbLivraisons !== "" || r.nbBacs !== "" || r.retards !== "" || r.km !== "";
+    return r.nbLivraisons !== "" || r.nbBacs !== "" || r.nbEnAvance !== "" || r.nbALHeure !== "" || r.retards !== "" || r.km !== "";
   }
 
   function saisieNum(v) { return Number(v) || 0; }
@@ -7721,8 +7808,8 @@
         var ent = DB.get("entrepots", r.entrepotId);
         var already = saisieJournalCount(day.date, lv.livreurId, r.entrepotId);
         var armed = pendingRm === "e:" + r.uid;
-        var field = function (key, lbl, attrs) {
-          return '<label class="sm-f"><span>' + lbl + '</span><input type="number" ' + attrs + ' class="sm-num' + (r.errField === key ? ' input-error' : '') + '" data-smf="' + key + '" data-smrow="' + r.uid + '" value="' + LM.escapeHtml(r[key]) + '" /></label>';
+        var field = function (key, lbl, attrs, cls) {
+          return '<label class="sm-f' + (cls ? ' ' + cls : '') + '"><span>' + lbl + '</span><input type="number" ' + attrs + ' class="sm-num' + (r.errField === key ? ' input-error' : '') + '" data-smf="' + key + '" data-smrow="' + r.uid + '" value="' + LM.escapeHtml(r[key]) + '" /></label>';
         };
         return '<div class="sm-ent">' +
           '<div class="sm-ent-head"><div><span class="sm-ent-name">' + LM.escapeHtml(ent ? ent.nom : "Entrepôt supprimé") + '</span>' +
@@ -7734,12 +7821,16 @@
           '<div class="sm-ent-grid">' +
             field("nbLivraisons", "Commandes *", 'min="0" step="1"') +
             field("nbBacs", "Bacs", 'min="0" step="1"') +
-            field("retards", "Retards", 'min="0" step="1"') +
             field("km", "Distance (km)", 'min="0" step="0.1"') +
+            field("nbEnAvance", "En avance", 'min="0" step="1"', "sm-f-early") +
+            field("nbALHeure", "À l\'heure", 'min="0" step="1"', "sm-f-ontime") +
+            field("retards", "Retards", 'min="0" step="1"', "sm-f-late") +
           '</div>' +
+          '<div class="sm-ent-hint" data-smhint="' + r.uid + '"></div>' +
         '</div>';
       }).join("");
 
+      lv.entrepots.forEach(function (r) { refreshHint(r); });
       frame.querySelectorAll(".sm-num").forEach(function (inp) {
         inp.addEventListener("input", function () {
           var row = findRow(inp.getAttribute("data-smrow"));
@@ -7748,6 +7839,7 @@
           row.errField = null;
           inp.classList.remove("input-error");
           disarm();
+          refreshHint(row);
           renderLivFrame(); renderTabs(); renderSummary();
         });
       });
@@ -7762,6 +7854,35 @@
           renderLivFrame(); renderEntFrame(); renderTabs(); renderSummary();
         });
       });
+    }
+
+    // Ligne d'aide sous les champs d'une carte : combien de commandes restent sans classement
+    // (en avance / à l'heure / en retard), avec un raccourci pour mettre le reste « à l'heure ».
+    function refreshHint(row) {
+      var el = q('[data-smhint="' + row.uid + '"]');
+      if (!el) return;
+      var started = row.nbEnAvance !== "" || row.nbALHeure !== "" || row.retards !== "";
+      if (row.nbLivraisons === "" || !started) { el.innerHTML = ""; return; }
+      var cmd = saisieNum(row.nbLivraisons);
+      var rest = cmd - saisieNum(row.nbEnAvance) - saisieNum(row.nbALHeure) - saisieNum(row.retards);
+      if (rest > 0) {
+        el.innerHTML = '<span>' + rest + ' commande' + (rest > 1 ? 's' : '') + ' non classée' + (rest > 1 ? 's' : '') + '</span> <button type="button" class="sm-link" data-smfill="' + row.uid + '">Mettre le reste « à l\'heure »</button>';
+        el.className = "sm-ent-hint";
+        var b = el.querySelector("[data-smfill]");
+        if (b) b.addEventListener("click", function () {
+          row.nbALHeure = String(saisieNum(row.nbALHeure) + rest);
+          row.errField = null;
+          var inp = q('[data-smrow="' + row.uid + '"][data-smf="nbALHeure"]');
+          if (inp) { inp.value = row.nbALHeure; inp.classList.remove("input-error"); }
+          refreshHint(row);
+        });
+      } else if (rest < 0) {
+        el.className = "sm-ent-hint sm-ent-hint-bad";
+        el.innerHTML = '<span>Trop élevé : ' + (-rest) + ' de plus que le nombre de commandes</span>';
+      } else {
+        el.className = "sm-ent-hint sm-ent-hint-ok";
+        el.innerHTML = '<span>Toutes les commandes sont classées ✓</span>';
+      }
     }
 
     function findRow(rowUid) {
@@ -7896,12 +8017,21 @@
               fail(day, lv, r, neg, "Valeur invalide pour " + name + " (" + DB.fmtDate(day.date) + ") : un nombre positif est attendu.");
               return;
             }
+            var neg2 = ["nbEnAvance", "nbALHeure"].filter(function (f) { return r[f] !== "" && (isNaN(Number(r[f])) || Number(r[f]) < 0); })[0];
+            if (neg2) {
+              fail(day, lv, r, neg2, "Valeur invalide pour " + name + " (" + DB.fmtDate(day.date) + ") : un nombre positif est attendu.");
+              return;
+            }
             if (saisieNum(r.retards) > Number(cmd)) {
               fail(day, lv, r, "retards", "Le nombre de retards ne peut pas dépasser le nombre de commandes (" + name + ", " + DB.fmtDate(day.date) + ").");
               return;
             }
+            if (saisieNum(r.nbEnAvance) + saisieNum(r.nbALHeure) + saisieNum(r.retards) > Number(cmd)) {
+              fail(day, lv, r, "nbALHeure", "En avance + à l'heure + en retard dépasse le nombre de commandes (" + name + ", " + DB.fmtDate(day.date) + ").");
+              return;
+            }
             var ent = DB.get("entrepots", r.entrepotId);
-            records.push({
+            var rec = {
               date: day.date,
               entrepotId: r.entrepotId, entrepotNom: ent ? ent.nom : null,
               livreurId: lv.livreurId, livreurNom: l ? name : null,
@@ -7911,7 +8041,11 @@
               incidents: saisieNum(r.retards),
               commentaire: "",
               source: "manuel"
-            });
+            };
+            // En avance / à l'heure : enregistrés seulement si l'un des deux est renseigné
+            // (sinon la ponctualité n'est pas suivie pour cette entrée, comme pour un import Excel).
+            if (r.nbEnAvance !== "" || r.nbALHeure !== "") { rec.nbEnAvance = saisieNum(r.nbEnAvance); rec.nbALHeure = saisieNum(r.nbALHeure); }
+            records.push(rec);
           }
         }
       }
@@ -8052,7 +8186,7 @@
       '</div>' +
       '<div class="table-wrap"><table><thead><tr>' +
         '<th style="width:34px;"></th>' +
-        '<th>Date</th><th>Entrepôt</th><th>Livreur</th><th class="num">Livraisons</th><th class="num">Bacs</th><th class="num">Km</th><th class="num">Incidents</th><th>Source</th><th></th>' +
+        '<th>Date</th><th>Entrepôt</th><th>Livreur</th><th class="num">Livraisons</th><th class="num">Bacs</th><th class="num">Km</th><th class="num">En avance</th><th class="num">À l\'heure</th><th class="num">Incidents</th><th>Source</th><th></th>' +
       '</tr></thead><tbody id="histBody"></tbody></table></div>' +
       '<div class="flex gap-10" style="margin-top:14px;align-items:center;justify-content:flex-end;">' +
         '<button class="btn btn-secondary btn-sm" id="prevPage"' + (journalPage <= 1 ? " disabled" : "") + '>Précédent</button>' +
@@ -8063,7 +8197,7 @@
 
     var histBody = document.getElementById("histBody");
     if (!pageRows.length) {
-      histBody.innerHTML = '<tr class="empty-row"><td colspan="10">Aucune entrée sur cette période.</td></tr>';
+      histBody.innerHTML = '<tr class="empty-row"><td colspan="12">Aucune entrée sur cette période.</td></tr>';
     } else {
       histBody.innerHTML = pageRows.map(function (r) {
         var badge = SOURCE_BADGES[r.source] || SOURCE_BADGES.manuel;
@@ -8075,6 +8209,8 @@
           '<td class="num">' + DB.fmtNum(r.nbLivraisons) + '</td>' +
           '<td class="num">' + DB.fmtNum(r.nbBacs) + '</td>' +
           '<td class="num">' + DB.fmtNum(r.km) + '</td>' +
+          '<td class="num">' + (r.nbEnAvance != null ? DB.fmtNum(r.nbEnAvance) : '<span class="text-faint">—</span>') + '</td>' +
+          '<td class="num">' + (r.nbALHeure != null ? DB.fmtNum(r.nbALHeure) : '<span class="text-faint">—</span>') + '</td>' +
           '<td class="num">' + DB.fmtNum(r.incidents) + '</td>' +
           '<td><span class="badge ' + badge.cls + '">' + badge.label + '</span></td>' +
           '<td class="actions">' +
@@ -8321,6 +8457,10 @@
               '<div class="hint">Lié à la page Retards : ' + (aucunRetardVal ? "entrée marquée comme étudiée, sans retard." : (existingRetard ? "mis à jour ici, les clients concernés déjà renseignés sont conservés." : "un signalement y sera créé.")) + '</div>' +
             '</div>' +
           '</div>' +
+          '<div class="form-row">' +
+            '<div class="field"><label>En avance</label><input type="number" min="0" name="nbEnAvance" value="' + (record.nbEnAvance != null ? record.nbEnAvance : "") + '" placeholder="Non renseigné" /></div>' +
+            '<div class="field"><label>À l\'heure</label><input type="number" min="0" name="nbALHeure" value="' + (record.nbALHeure != null ? record.nbALHeure : "") + '" placeholder="Non renseigné" /><div class="hint">En avance + à l\'heure + retards ne peut pas dépasser le nombre de livraisons.</div></div>' +
+          '</div>' +
           '<div class="field"><label>Commentaire</label><textarea name="commentaire">' + LM.escapeHtml(record.commentaire || "") + '</textarea></div>' +
           (extras ? '<div class="divider"></div><p class="text-sm text-faint">Informations complémentaires de l\'import (non modifiables) : ' + extras + '</p>' : "") +
           '<button type="submit" class="btn btn-primary">' + LM.icon("check") + ' Enregistrer les modifications</button>' +
@@ -8347,6 +8487,11 @@
           if (!isFinite(nRetard) || nRetard < 0) nRetard = 0;
           if (nRetard > nbLivraisons) { LM.toast("Le nombre de retards ne peut pas dépasser le nombre de livraisons (" + nbLivraisons + ").", "danger"); return; }
         }
+        var rawAvance = (fd.get("nbEnAvance") || "").toString().trim(), rawAlh = (fd.get("nbALHeure") || "").toString().trim();
+        var nAvance = rawAvance === "" ? null : Number(rawAvance), nAlh = rawAlh === "" ? null : Number(rawAlh);
+        if ((nAvance !== null && (!isFinite(nAvance) || nAvance < 0)) || (nAlh !== null && (!isFinite(nAlh) || nAlh < 0))) { LM.toast("En avance / à l'heure : un nombre positif est attendu.", "danger"); return; }
+        if ((nAvance || 0) + (nAlh || 0) + nRetard > nbLivraisons) { LM.toast("En avance + à l'heure + retards dépasse le nombre de livraisons (" + nbLivraisons + ").", "danger"); return; }
+        var punct = (nAvance === null && nAlh === null) ? { nbEnAvance: null, nbALHeure: null } : { nbEnAvance: nAvance || 0, nbALHeure: nAlh || 0 };
         var ent = DB.get("entrepots", entId);
         var livId = fd.get("livreurId") || null;
         var liv = livId ? DB.get("livreurs", livId) : null;
@@ -8358,6 +8503,7 @@
           nbBacs: Number(fd.get("nbBacs")) || 0,
           km: Number(fd.get("km")) || 0,
           incidents: nRetard,
+          nbEnAvance: punct.nbEnAvance, nbALHeure: punct.nbALHeure,
           commentaire: (fd.get("commentaire") || "").toString().trim()
         });
         var hadRetard = !!DB.retardPourLivraison(record.id);
@@ -11307,140 +11453,418 @@
   // réutilisable depuis l'onglet Historique et depuis la fenêtre récapitulative d'un livreur
   // (onglet Planning, clic sur le nom d'un livreur). `presetLivreurId` pré-sélectionne le
   // livreur lorsqu'on ouvre le formulaire depuis sa fiche.
+  // Présentation identique au pop-up « Saisie manuelle » d'Analyse : onglets (un par type d'absence),
+  // recherche de livreur à gauche, jours d'absence du livreur sélectionné à droite.
   // ------------------------------------------------------------------
   function openDemandeForm(existing, presetLivreurId) {
-    var livreurs = DB.list("livreurs");
     var isEdit = !!existing;
-    var defaultTypeKey = motifTypeKeys()[0] || "";
-    var d = existing || { livreurId: presetLivreurId || "", dateDemande: DB.todayISO(), type: defaultTypeKey, jours: [], motif: "" };
-    var jours = (d.jours || []).slice().sort();
+    var typeKeys = motifTypeKeys();
+    // Brouillon : un onglet par type d'absence ; dans chaque onglet, des livreurs, chacun avec ses
+    // jours et son motif. Chaque (type, livreur) donne UNE demande d'absence à l'enregistrement.
+    var tabs = [];
+    var activeType = null;
+    var activeLiv = {}; // type -> livreurId sélectionné
+    var dateDemande = existing ? (existing.dateDemande || DB.todayISO()) : DB.todayISO();
+    var addTypeOpen = false;
+    var pendingRm = null;
+    var modalEl = null;
+
+    if (existing) {
+      tabs.push({ type: existing.type, livreurs: [{ livreurId: existing.livreurId, jours: (existing.jours || []).slice().sort(), motif: existing.motif || "" }] });
+      activeType = existing.type;
+      activeLiv[existing.type] = existing.livreurId;
+    } else {
+      var t0 = typeKeys[0] || "";
+      tabs.push({ type: t0, livreurs: presetLivreurId ? [{ livreurId: presetLivreurId, jours: [], motif: "" }] : [] });
+      activeType = t0;
+      if (presetLivreurId) activeLiv[t0] = presetLivreurId;
+    }
+
+    function q(sel) { return modalEl.querySelector(sel); }
+    function findTab(type) { for (var i = 0; i < tabs.length; i++) { if (tabs[i].type === type) return tabs[i]; } return null; }
+    function curTab() { return findTab(activeType); }
+    function findLiv(tab, id) { if (!tab) return null; for (var i = 0; i < tab.livreurs.length; i++) { if (tab.livreurs[i].livreurId === id) return tab.livreurs[i]; } return null; }
+    function curLiv() { var t = curTab(); return t ? findLiv(t, activeLiv[t.type]) : null; }
+    function dayLabel(iso) { return new Date(iso + "T00:00:00").toLocaleDateString("fr-FR", { weekday: "short" }) + " " + DB.fmtDate(iso); }
+    function plural(n, w) { return n + " " + w + (n > 1 ? "s" : ""); }
+    function periodsOf(jours) {
+      var out = [];
+      jours.slice().sort().forEach(function (j) {
+        var last = out[out.length - 1];
+        if (last && addDaysIso(last.fin, 1) === j) { last.fin = j; last.list.push(j); }
+        else out.push({ debut: j, fin: j, list: [j] });
+      });
+      return out;
+    }
+    function typeColor(type) { var d = dayTypeDef(type); return d.color || "#9aa1b1"; }
+
+    // Solde de CP / RTT du livreur (si suivi) : restant aujourd'hui puis après cette demande.
+    function soldeInfo(lv, type) {
+      if (type !== "cp" && type !== "rtt") return null;
+      var l = DB.get("livreurs", lv.livreurId);
+      if (!l) return null;
+      var year = lv.jours.length ? Number(lv.jours[0].slice(0, 4)) : new Date().getFullYear();
+      var t = DB.soldeConges(l, year)[type];
+      if (!t || !t.suivi) return null;
+      var net = lv.jours.filter(function (j) {
+        if (Number(j.slice(0, 4)) !== year || !DB.livreurEmbaucheLe(l, j)) return false;
+        var e = DB.planningEntreeFor(l.id, j);
+        return !(e && e.type === type); // un jour déjà posé dans ce type est déjà décompté
+      }).length;
+      return { restant: t.restant, apres: t.restant - net, year: year };
+    }
 
     LM.openModal({
-      title: isEdit ? "Modifier la demande" : "Nouvelle demande d'absence",
-      wide: true,
+      title: isEdit ? "Modifier la demande d'absence" : "Nouvelle demande d'absence",
       bodyHtml:
-        '<form id="demForm">' +
-          '<div class="form-row">' +
-            '<div class="field"><label>Livreur *</label><select name="livreurId" required>' +
-              '<option value="">Sélectionner…</option>' +
-              livreurs.map(function (l) { return '<option value="' + l.id + '"' + (l.id === d.livreurId ? " selected" : "") + '>' + LM.escapeHtml(DB.livreurNomComplet(l)) + '</option>'; }).join("") +
-            '</select></div>' +
-              '<div class="field"><label>Date de la demande</label><input type="date" name="dateDemande" value="' + d.dateDemande + '" /></div>' +
-            '</div>' +
-            '<div class="field"><label>Type d\'absence</label><select name="type">' +
-              (motifTypeKeys().length ? motifTypeKeys().map(function (k) { return '<option value="' + k + '"' + (k === d.type ? " selected" : "") + '>' + LM.escapeHtml(dayTypeDef(k).label) + '</option>'; }).join("") : '<option value="">Aucun type disponible — ajoutez-en depuis Annexes</option>') +
-            '</select></div>' +
-            '<div class="field">' +
-              '<label>Jours concernés</label>' +
-              '<div class="date-picker-panel">' +
-                '<div class="form-row" style="align-items:flex-end;margin-bottom:10px;">' +
-                  '<div class="field mb-0"><label>Ajouter un jour</label><input type="date" id="demDateSingle" /></div>' +
-                  '<div class="field mb-0"><button type="button" class="btn btn-secondary btn-sm" id="btnAddDemDate">' + LM.icon("plus") + ' Ajouter</button></div>' +
-                '</div>' +
-                '<div class="form-row" style="align-items:flex-end;margin-bottom:10px;">' +
-                  '<div class="field mb-0"><label>Du</label><input type="date" id="demRangeStart" /></div>' +
-                  '<div class="field mb-0"><label>Au</label><input type="date" id="demRangeEnd" /></div>' +
-                  '<div class="field mb-0"><button type="button" class="btn btn-secondary btn-sm" id="btnAddDemRange">' + LM.icon("plus") + ' Ajouter la période</button></div>' +
-                '</div>' +
-                '<div class="date-chip-list" id="demChips"></div>' +
-              '</div>' +
-            '</div>' +
-            '<div class="field"><label>Motif</label><textarea name="motif" placeholder="ex : Congés d\'été, RDV médical…">' + LM.escapeHtml(d.motif || "") + '</textarea></div>' +
-          '</form>',
-        footerHtml:
-          '<button class="btn btn-secondary" id="cancelBtn">Annuler</button>' +
-          (isEdit ? '<button class="btn btn-danger" id="deleteBtn">Supprimer</button>' : '') +
-          '<button class="btn btn-primary" id="saveBtn">' + (isEdit ? "Enregistrer" : "Créer la demande") + '</button>',
-        onMount: function (modal) {
-          renderChips();
-
-          modal.querySelector("#btnAddDemDate").addEventListener("click", function () {
-            var input = modal.querySelector("#demDateSingle");
-            var v = input.value;
-            if (!v) return;
-            if (jours.indexOf(v) === -1) { jours.push(v); jours.sort(); renderChips(); }
-            input.value = "";
-          });
-          modal.querySelector("#btnAddDemRange").addEventListener("click", function () {
-            var start = modal.querySelector("#demRangeStart").value;
-            var end = modal.querySelector("#demRangeEnd").value;
-            if (!start || !end || start > end) { LM.toast("Période invalide.", "danger"); return; }
-            var cur = start, added = 0;
-            while (cur <= end) {
-              if (jours.indexOf(cur) === -1) { jours.push(cur); added++; }
-              cur = addDaysIso(cur, 1);
-            }
-            jours.sort();
-            renderChips();
-            if (added) LM.toast(added + " jour(s) ajouté(s).", "success");
-          });
-          modal.querySelector("#cancelBtn").addEventListener("click", LM.closeModal);
-          if (isEdit) {
-            modal.querySelector("#deleteBtn").addEventListener("click", function () {
-              LM.confirmDialog("Supprimer définitivement cette demande ?", function () {
-                DB.remove("demandesAbsence", d.id);
-                var lDel2 = DB.get("livreurs", d.livreurId);
-                DB.logHistorique("Planning", "suppression", "Suppression demande d'absence : " + (lDel2 ? DB.livreurNomComplet(lDel2) : "livreur inconnu"));
-                LM.toast("Demande supprimée.", "success");
-                LM.closeModal();
-                render(document.getElementById("content"));
-              });
+        '<div class="sm-tabs dm-tabs" id="dmTabs"></div>' +
+        '<div id="dmAddPanel"></div>' +
+        '<div id="dmBody"></div>',
+      footerHtml:
+        '<span class="sm-summary" id="dmSummary"></span>' +
+        (isEdit ? '<button type="button" class="btn btn-danger" id="dmDelete">Supprimer</button>' : '') +
+        '<button type="button" class="btn btn-secondary" id="dmCancel">Annuler</button>' +
+        '<button type="button" class="btn btn-primary" id="dmSave">' + LM.icon("check") + ' ' + (isEdit ? "Enregistrer" : "Créer la demande") + '</button>',
+      onMount: function (modal) {
+        modalEl = modal;
+        modal.classList.add("modal-saisie");
+        renderAll();
+        q("#dmCancel").addEventListener("click", LM.closeModal);
+        q("#dmSave").addEventListener("click", save);
+        if (isEdit) {
+          q("#dmDelete").addEventListener("click", function () {
+            LM.confirmDialog("Supprimer définitivement cette demande ?", function () {
+              DB.remove("demandesAbsence", existing.id);
+              var lDel = DB.get("livreurs", existing.livreurId);
+              DB.logHistorique("Planning", "suppression", "Suppression demande d'absence : " + (lDel ? DB.livreurNomComplet(lDel) : "livreur inconnu"));
+              LM.toast("Demande supprimée.", "success");
+              render(document.getElementById("content"));
             });
-          }
-          modal.querySelector("#saveBtn").addEventListener("click", function () {
-            var fd = new FormData(modal.querySelector("#demForm"));
-            var livreurId = fd.get("livreurId");
-            if (!livreurId) { LM.toast("Sélectionnez un livreur.", "danger"); return; }
-            if (!jours.length) { LM.toast("Ajoutez au moins un jour concerné.", "danger"); return; }
-            var payload = {
-              livreurId: livreurId,
-              dateDemande: fd.get("dateDemande") || DB.todayISO(),
-              type: fd.get("type"),
-              jours: jours.slice(),
-              motif: (fd.get("motif") || "").toString().trim()
-            };
-            if (isEdit) DB.update("demandesAbsence", d.id, payload);
-            else DB.add("demandesAbsence", payload);
-            var lLog = DB.get("livreurs", livreurId);
-            DB.logHistorique("Planning", isEdit ? "modification" : "ajout", (isEdit ? "Modification" : "Ajout") + " demande d'absence : " + (lLog ? DB.livreurNomComplet(lLog) : "livreur inconnu") + " (" + dayTypeDef(payload.type).label + ", " + payload.jours.length + " jour(s))");
-
-            // La demande met aussi immédiatement à jour les cases correspondantes du planning
-            // (sans attendre un clic sur "Proposer planning") : c'est une génération rapide et
-            // toujours fiable, qui ne porte que sur les jours de cette demande.
-            // Les jours antérieurs à la date d'embauche du livreur ne génèrent pas de case.
-            var livDem = DB.get("livreurs", payload.livreurId);
-            var toUpsert = payload.jours.filter(function (j) { return DB.livreurEmbaucheLe(livDem, j); }).map(function (j) {
-              return { livreurId: payload.livreurId, date: j, patch: { type: payload.type, heureDebut: "", heureFin: "", pauseDuree: 0, commentaire: payload.motif || "", fromDemande: true } };
-            });
-            var result = DB.bulkUpsertPlanningEntree(toUpsert);
-
-            if (!result.saved) {
-              LM.toast("La demande n'a pas pu être enregistrée (espace de stockage local insuffisant). Libérez de l'espace puis réessayez.", "danger");
-              return;
-            }
-
-            LM.toast("Demande enregistrée et planning mis à jour pour " + toUpsert.length + " jour(s)." +
-              (toUpsert.length < payload.jours.length ? " " + (payload.jours.length - toUpsert.length) + " jour(s) antérieur(s) à l'embauche ignoré(s) dans le planning." : ""), "success");
-            LM.closeModal();
-            render(document.getElementById("content"));
           });
-
-          function renderChips() {
-            var wrap = modal.querySelector("#demChips");
-            wrap.innerHTML = jours.length ? jours.map(function (j) {
-              return '<span class="date-chip">' + DB.fmtDate(j) + '<button type="button" data-rmjour="' + j + '">' + LM.icon("close") + '</button></span>';
-            }).join("") : '<span class="text-faint text-sm">Aucun jour sélectionné.</span>';
-            wrap.querySelectorAll("[data-rmjour]").forEach(function (btn) {
-              btn.addEventListener("click", function () {
-                var v = btn.getAttribute("data-rmjour");
-                jours = jours.filter(function (j) { return j !== v; });
-                renderChips();
-              });
-            });
-          }
         }
+      }
+    });
+
+    // ---------------------------------------------------------------- rendu
+    function renderAll() { renderTabs(); renderAddPanel(); renderBody(); renderSummary(); }
+
+    function totals() {
+      var t = { dem: 0, jours: 0 };
+      tabs.forEach(function (tab) { tab.livreurs.forEach(function (lv) { if (lv.jours.length) { t.dem++; t.jours += lv.jours.length; } }); });
+      return t;
+    }
+
+    function renderSummary() {
+      var t = totals();
+      q("#dmSummary").innerHTML = t.dem
+        ? '<strong>' + plural(t.dem, "demande") + '</strong> · <strong>' + plural(t.jours, "jour") + '</strong> d\'absence'
+        : 'Aucun jour sélectionné pour le moment';
+      var btn = q("#dmSave");
+      btn.disabled = !t.dem || !typeKeys.length;
+    }
+
+    function renderTabs() {
+      var el = q("#dmTabs");
+      el.innerHTML = tabs.map(function (tab) {
+        var n = tab.livreurs.length;
+        var active = tab.type === activeType;
+        var armed = pendingRm === "t:" + tab.type;
+        var rm = locked() ? "" : (armed
+          ? '<button type="button" class="sm-tab-x sm-tab-x-confirm" data-dmrmtab="' + tab.type + '">Supprimer ?</button>'
+          : '<button type="button" class="sm-tab-x" data-dmrmtab="' + tab.type + '" title="Retirer ce type">' + LM.icon("close") + '</button>');
+        return '<div class="sm-tab' + (active ? ' active' : '') + '">' +
+          '<button type="button" class="sm-tab-main dm-tab-main" data-dmtab="' + tab.type + '"><span class="dm-dot" style="background:' + LM.escapeHtml(typeColor(tab.type)) + ';"></span>' + LM.escapeHtml(tab.type ? dayTypeDef(tab.type).label : "Aucun type") +
+          (n ? ' <span class="sm-tab-n">' + n + '</span>' : '') + '</button>' + rm + '</div>';
+      }).join("") +
+        (locked() ? '' : '<button type="button" class="btn btn-secondary btn-sm" id="dmAddType">' + LM.icon("plus") + ' Ajouter un type</button>') +
+        '<div class="dm-date-demande"><label for="dmDateDemande">Date de la demande</label><input type="date" id="dmDateDemande" value="' + LM.escapeHtml(dateDemande) + '" /></div>';
+
+      el.querySelectorAll("[data-dmtab]").forEach(function (b) {
+        b.addEventListener("click", function () { activeType = b.getAttribute("data-dmtab"); pendingRm = null; renderAll(); });
+      });
+      el.querySelectorAll("[data-dmrmtab]").forEach(function (b) {
+        b.addEventListener("click", function () {
+          var type = b.getAttribute("data-dmrmtab");
+          var tab = findTab(type);
+          if (!tab) return;
+          var hasData = tab.livreurs.length > 0;
+          if (hasData && pendingRm !== "t:" + type) { pendingRm = "t:" + type; renderTabs(); return; }
+          tabs = tabs.filter(function (x) { return x.type !== type; });
+          if (!tabs.length) tabs.push({ type: typeKeys[0] || "", livreurs: [] });
+          if (activeType === type) activeType = tabs[0].type;
+          pendingRm = null;
+          renderAll();
+        });
+      });
+      var add = el.querySelector("#dmAddType");
+      if (add) add.addEventListener("click", function () { addTypeOpen = !addTypeOpen; renderAddPanel(); });
+      el.querySelector("#dmDateDemande").addEventListener("change", function (e) { dateDemande = e.target.value || DB.todayISO(); });
+    }
+
+    function renderAddPanel() {
+      var el = q("#dmAddPanel");
+      if (!addTypeOpen) { el.innerHTML = ""; return; }
+      var left = typeKeys.filter(function (k) { return !findTab(k); });
+      el.innerHTML = '<div class="date-picker-panel sm-addpanel"><div class="cl-ent-filter" style="margin-top:0;">' +
+        (left.length
+          ? '<span class="cl-ent-filter-label">Choisir un type d\'absence :</span>' + left.map(function (k) {
+              return '<button type="button" class="cl-chip" data-dmaddtype="' + k + '"><span class="dm-dot" style="background:' + LM.escapeHtml(typeColor(k)) + ';"></span>' + LM.escapeHtml(dayTypeDef(k).label) + '</button>';
+            }).join("")
+          : '<span class="text-sm text-faint">Tous les types d\'absence sont déjà ouverts.</span>') +
+        '</div></div>';
+      el.querySelectorAll("[data-dmaddtype]").forEach(function (b) {
+        b.addEventListener("click", function () {
+          var k = b.getAttribute("data-dmaddtype");
+          if (!findTab(k)) tabs.push({ type: k, livreurs: [] });
+          activeType = k; addTypeOpen = false; pendingRm = null;
+          renderAll();
+        });
       });
     }
+
+    function locked() { return isEdit; }
+
+    function renderBody() {
+      var tab = curTab();
+      var body = q("#dmBody");
+      if (!typeKeys.length && !isEdit) {
+        body.innerHTML = '<div class="sm-empty">Aucun type d\'absence n\'est défini.<br />Ajoutez-en depuis la page <strong>Annexes</strong> pour créer une demande.</div>';
+        return;
+      }
+      body.innerHTML =
+        '<div class="sm-cols">' +
+          '<div class="sm-col">' +
+            '<label class="sm-label">Livreurs <span class="sm-label-sub">— ' + LM.escapeHtml(dayTypeDef(tab.type).label) + '</span></label>' +
+            '<div class="sm-search"><span class="sm-search-ic">' + LM.icon("search") + '</span><input type="text" class="sm-input" id="dmLivSearch" placeholder="' + (locked() ? "Livreur de la demande" : "Rechercher un livreur…") + '" autocomplete="off"' + (locked() ? ' disabled' : '') + ' /><div class="sm-drop" id="dmLivDrop" hidden></div></div>' +
+            '<div class="sm-frame" id="dmLivFrame"></div>' +
+          '</div>' +
+          '<div class="sm-col" id="dmRight"></div>' +
+        '</div>';
+      renderLivFrame();
+      renderRight();
+      if (!locked()) LM.searchDrop(q("#dmLivSearch"), q("#dmLivDrop"), livItems, pickLivreur);
+    }
+
+    function renderLivFrame() {
+      var tab = curTab();
+      var frame = q("#dmLivFrame");
+      if (!frame || !tab) return;
+      if (!tab.livreurs.length) {
+        frame.innerHTML = '<div class="sm-empty">Aucun livreur pour ce type d\'absence.<br />Recherchez un livreur ci-dessus pour l\'ajouter.</div>';
+        return;
+      }
+      var activeId = activeLiv[tab.type];
+      frame.innerHTML = tab.livreurs.map(function (lv) {
+        var l = DB.get("livreurs", lv.livreurId);
+        var name = l ? DB.livreurNomComplet(l) : "Livreur supprimé";
+        var meta = lv.jours.length ? plural(lv.jours.length, "jour") + " d'absence" : "Aucun jour";
+        var so = soldeInfo(lv, tab.type);
+        var armed = pendingRm === "l:" + lv.livreurId;
+        return '<div class="sm-liv' + (lv.livreurId === activeId ? ' active' : '') + (lv.jours.length ? '' : ' sm-liv-empty') + '" data-dmliv="' + lv.livreurId + '" tabindex="0" role="button">' +
+          '<div class="sm-liv-main"><span class="sm-liv-name">' + LM.escapeHtml(name) + '</span><span class="sm-liv-meta">' + meta + '</span>' +
+          (so ? '<span class="badge ' + (so.apres < 0 ? 'badge-danger' : 'badge-info') + ' sm-liv-warn" title="Solde ' + so.year + ' : ' + so.restant + ' j restant(s), ' + so.apres + ' j après cette demande">Solde ' + LM.escapeHtml(dayTypeDef(tab.type).short) + ' : ' + so.restant + ' j' + (so.apres !== so.restant ? ' → ' + so.apres + ' j' : '') + '</span>' : '') + '</div>' +
+          (locked() ? '' : (armed
+            ? '<button type="button" class="sm-x sm-x-confirm" data-dmlivrm="' + lv.livreurId + '">Retirer ?</button>'
+            : '<button type="button" class="sm-x" data-dmlivrm="' + lv.livreurId + '" title="Retirer ce livreur">' + LM.icon("close") + '</button>')) +
+          '</div>';
+      }).join("");
+      frame.querySelectorAll("[data-dmliv]").forEach(function (card) {
+        function select() { activeLiv[tab.type] = card.getAttribute("data-dmliv"); pendingRm = null; renderLivFrame(); renderRight(); }
+        card.addEventListener("click", select);
+        card.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); select(); } });
+      });
+      frame.querySelectorAll("[data-dmlivrm]").forEach(function (b) {
+        b.addEventListener("click", function (e) {
+          e.stopPropagation();
+          var id = b.getAttribute("data-dmlivrm");
+          var lv = findLiv(tab, id);
+          if (!lv) return;
+          if (lv.jours.length && pendingRm !== "l:" + id) { pendingRm = "l:" + id; renderLivFrame(); return; }
+          tab.livreurs = tab.livreurs.filter(function (x) { return x.livreurId !== id; });
+          if (activeLiv[tab.type] === id) activeLiv[tab.type] = tab.livreurs.length ? tab.livreurs[0].livreurId : null;
+          pendingRm = null;
+          renderLivFrame(); renderRight(); renderTabs(); renderSummary();
+        });
+      });
+    }
+
+    function livItems() {
+      var tab = curTab();
+      if (!tab) return [];
+      return DB.list("livreurs").filter(function (l) { return l.statut !== "inactif" && !findLiv(tab, l.id); }).map(function (l) {
+        var ents = (Array.isArray(l.entrepotIds) ? l.entrepotIds : []).map(function (id) { return DB.entrepotNom(id); }).filter(Boolean);
+        return { id: l.id, label: DB.livreurNomComplet(l), sub: ents.join(", ") };
+      }).sort(function (a, b) { return a.label.localeCompare(b.label, "fr"); });
+    }
+
+    function pickLivreur(item) {
+      var tab = curTab();
+      if (!tab) return;
+      tab.livreurs.push({ livreurId: item.id, jours: [], motif: "" });
+      activeLiv[tab.type] = item.id;
+      pendingRm = null;
+      q("#dmLivSearch").value = "";
+      renderLivFrame(); renderRight(); renderTabs(); renderSummary();
+      var one = q("#dmDateOne");
+      if (one) one.focus();
+    }
+
+    // ---------------------------------------------------------------- partie droite : jours du livreur
+    function renderRight() {
+      var tab = curTab();
+      var lv = curLiv();
+      var host = q("#dmRight");
+      if (!host || !tab) return;
+      if (!lv) {
+        host.innerHTML = '<label class="sm-label">Jours d\'absence</label><div class="sm-frame"><div class="sm-empty">' + (tab.livreurs.length ? 'Cliquez sur un livreur dans le cadre de gauche<br />pour saisir ses jours d\'absence.' : 'Ajoutez un livreur à gauche pour commencer.') + '</div></div>';
+        return;
+      }
+      var l = DB.get("livreurs", lv.livreurId);
+      var tomorrow = lv.jours.length ? addDaysIso(lv.jours[lv.jours.length - 1], 1) : DB.todayISO();
+      host.innerHTML =
+        '<label class="sm-label">Jours d\'absence <span class="sm-label-sub">— ' + LM.escapeHtml(l ? DB.livreurNomComplet(l) : "Livreur supprimé") + '</span></label>' +
+        '<div class="date-picker-panel dm-adder">' +
+          '<div class="dm-adder-row">' +
+            '<div class="field mb-0" style="flex:0 0 150px;"><label>Un jour</label><input type="date" id="dmDateOne" value="' + tomorrow + '" /></div>' +
+            '<div class="field mb-0"><button type="button" class="btn btn-secondary btn-sm" id="dmDateOneBtn">' + LM.icon("plus") + ' Ajouter</button></div>' +
+            '<div class="sm-sep"></div>' +
+            '<div class="field mb-0" style="flex:0 0 140px;"><label>Du</label><input type="date" id="dmFrom" /></div>' +
+            '<div class="field mb-0" style="flex:0 0 140px;"><label>Au</label><input type="date" id="dmTo" /></div>' +
+            '<div class="field mb-0"><div class="checkbox-row" style="height:38px;"><input type="checkbox" id="dmSkipSun" checked /><label for="dmSkipSun">Sans dimanches</label></div></div>' +
+            '<div class="field mb-0"><button type="button" class="btn btn-secondary btn-sm" id="dmRangeBtn">' + LM.icon("plus") + ' Ajouter la période</button></div>' +
+          '</div>' +
+        '</div>' +
+        '<div class="sm-frame dm-frame" id="dmFrame"></div>' +
+        '<div class="dm-foot">' +
+          '<div class="field mb-0" style="flex:1;"><label>Motif <span class="text-faint" style="font-weight:500;">(optionnel)</span></label><input type="text" id="dmMotif" value="' + LM.escapeHtml(lv.motif || "") + '" placeholder="ex : Congés d\'été, RDV médical…" /></div>' +
+          (tab.livreurs.length > 1 && !locked() ? '<button type="button" class="btn btn-secondary btn-sm" id="dmCopy" title="Ajoute ces jours (et le motif s\'il est vide) aux autres livreurs de cet onglet">' + LM.icon("copy") + ' Copier vers les autres livreurs</button>' : '') +
+        '</div>';
+      renderFrame();
+
+      q("#dmDateOneBtn").addEventListener("click", function () {
+        var v = q("#dmDateOne").value;
+        if (!v) { LM.toast("Choisissez un jour.", "danger"); return; }
+        if (lv.jours.indexOf(v) !== -1) { LM.toast("Ce jour est déjà dans la liste.", "info"); return; }
+        lv.jours.push(v); lv.jours.sort();
+        afterDaysChange();
+        var one = q("#dmDateOne"); if (one) one.value = addDaysIso(v, 1);
+      });
+      q("#dmRangeBtn").addEventListener("click", function () {
+        var s = q("#dmFrom").value, e = q("#dmTo").value;
+        if (!s || !e || s > e) { LM.toast("Période invalide.", "danger"); return; }
+        var skip = q("#dmSkipSun").checked, cur = s, added = 0, guard = 0;
+        while (cur <= e && guard < 400) {
+          var isSunday = new Date(cur + "T00:00:00").getDay() === 0;
+          if (!(skip && isSunday) && lv.jours.indexOf(cur) === -1) { lv.jours.push(cur); added++; }
+          cur = addDaysIso(cur, 1); guard++;
+        }
+        lv.jours.sort();
+        afterDaysChange();
+        LM.toast(added ? plural(added, "jour") + " ajouté" + (added > 1 ? "s" : "") + "." : "Aucun nouveau jour (déjà présents ou dimanches exclus).", added ? "success" : "info");
+      });
+      q("#dmMotif").addEventListener("input", function (e) { lv.motif = e.target.value; });
+      var copy = q("#dmCopy");
+      if (copy) copy.addEventListener("click", function () {
+        if (!lv.jours.length) { LM.toast("Ajoutez d'abord des jours à ce livreur.", "info"); return; }
+        var n = 0;
+        tab.livreurs.forEach(function (other) {
+          if (other === lv) return;
+          lv.jours.forEach(function (j) { if (other.jours.indexOf(j) === -1) other.jours.push(j); });
+          other.jours.sort();
+          if (!other.motif && lv.motif) other.motif = lv.motif;
+          n++;
+        });
+        renderLivFrame(); renderTabs(); renderSummary();
+        LM.toast("Jours copiés vers " + plural(n, "autre livreur") + ".", "success");
+      });
+    }
+
+    function afterDaysChange() { renderFrame(); renderLivFrame(); renderTabs(); renderSummary(); }
+
+    // Cadre des jours : une carte par période (jours consécutifs regroupés), avec avertissements.
+    function renderFrame() {
+      var tab = curTab(), lv = curLiv();
+      var frame = q("#dmFrame");
+      if (!frame || !lv) return;
+      var l = DB.get("livreurs", lv.livreurId);
+      if (!lv.jours.length) { frame.innerHTML = '<div class="sm-empty">Aucun jour pour ce livreur.<br />Ajoutez un jour ou une période ci-dessus.</div>'; return; }
+      frame.innerHTML = periodsOf(lv.jours).map(function (p, i) {
+        var n = p.list.length;
+        var titre = n === 1 ? dayLabel(p.debut) : 'Du ' + dayLabel(p.debut) + ' au ' + dayLabel(p.fin);
+        var avant = 0, ecrase = 0;
+        p.list.forEach(function (j) {
+          if (l && !DB.livreurEmbaucheLe(l, j)) { avant++; return; }
+          var e = l ? DB.planningEntreeFor(l.id, j) : null;
+          if (e && e.type !== "travail" && e.type !== "repos" && e.type !== tab.type) ecrase++;
+        });
+        return '<div class="sm-ent dm-per"><div class="sm-ent-head" style="margin:0;"><div><span class="sm-ent-name">' + LM.escapeHtml(titre) + '</span>' +
+          '<span class="badge badge-info sm-ent-dup">' + plural(n, "jour") + '</span>' +
+          (avant ? '<span class="badge badge-warning sm-ent-dup" title="Ces jours sont antérieurs à l\'embauche : ils ne seront pas ajoutés au planning">' + avant + ' avant embauche</span>' : '') +
+          (ecrase ? '<span class="badge badge-warning sm-ent-dup" title="Une autre absence est déjà posée sur ces jours du planning : elle sera remplacée">' + ecrase + ' remplace' + (ecrase > 1 ? 'nt' : '') + ' une autre absence</span>' : '') +
+          '</div><button type="button" class="sm-x" data-dmrmper="' + i + '" title="Retirer cette période">' + LM.icon("close") + '</button></div></div>';
+      }).join("");
+      var pers = periodsOf(lv.jours);
+      frame.querySelectorAll("[data-dmrmper]").forEach(function (b) {
+        b.addEventListener("click", function () {
+          var p = pers[Number(b.getAttribute("data-dmrmper"))];
+          if (!p) return;
+          lv.jours = lv.jours.filter(function (j) { return p.list.indexOf(j) === -1; });
+          afterDaysChange();
+        });
+      });
+    }
+
+    // ---------------------------------------------------------------- enregistrement
+    function save() {
+      var jobs = [], seen = {};
+      for (var i = 0; i < tabs.length; i++) {
+        var tab = tabs[i];
+        for (var j = 0; j < tab.livreurs.length; j++) {
+          var lv = tab.livreurs[j];
+          var l = DB.get("livreurs", lv.livreurId);
+          var name = l ? DB.livreurNomComplet(l) : "Livreur supprimé";
+          if (!lv.jours.length) {
+            activeType = tab.type; activeLiv[tab.type] = lv.livreurId; renderAll();
+            LM.toast(name + " n'a aucun jour pour « " + dayTypeDef(tab.type).label + " » : ajoutez-en ou retirez ce livreur.", "danger");
+            return;
+          }
+          for (var k = 0; k < lv.jours.length; k++) {
+            var key = lv.livreurId + "|" + lv.jours[k];
+            if (seen[key]) {
+              activeType = tab.type; activeLiv[tab.type] = lv.livreurId; renderAll();
+              LM.toast(name + " a déjà le " + DB.fmtDate(lv.jours[k]) + " dans le type « " + dayTypeDef(seen[key]).label + " » : un jour ne peut avoir qu'un seul type d'absence.", "danger");
+              return;
+            }
+            seen[key] = tab.type;
+          }
+          jobs.push({ type: tab.type, lv: lv, livreur: l });
+        }
+      }
+      if (!jobs.length) { LM.toast("Ajoutez au moins un livreur et un jour.", "danger"); return; }
+      var toUpsert = [], nbIgnores = 0, created = 0;
+      jobs.forEach(function (job) {
+        var payload = { livreurId: job.lv.livreurId, dateDemande: dateDemande || DB.todayISO(), type: job.type, jours: job.lv.jours.slice().sort(), motif: (job.lv.motif || "").toString().trim() };
+        if (isEdit) DB.update("demandesAbsence", existing.id, payload); else DB.add("demandesAbsence", payload);
+        created++;
+        DB.logHistorique("Planning", isEdit ? "modification" : "ajout", (isEdit ? "Modification" : "Ajout") + " demande d'absence : " + (job.livreur ? DB.livreurNomComplet(job.livreur) : "livreur inconnu") + " (" + dayTypeDef(payload.type).label + ", " + plural(payload.jours.length, "jour") + ")");
+        payload.jours.forEach(function (d) {
+          if (job.livreur && !DB.livreurEmbaucheLe(job.livreur, d)) { nbIgnores++; return; }
+          toUpsert.push({ livreurId: payload.livreurId, date: d, patch: { type: payload.type, heureDebut: "", heureFin: "", pauseDuree: 0, commentaire: payload.motif || "", fromDemande: true } });
+        });
+      });
+      // La demande met aussitôt à jour les cases du planning concernées (jours antérieurs à
+      // l'embauche exclus), sans attendre « Proposer planning ».
+      var result = DB.bulkUpsertPlanningEntree(toUpsert);
+      if (!result.saved) {
+        LM.toast("La demande n'a pas pu être enregistrée (espace de stockage local insuffisant). Libérez de l'espace puis réessayez.", "danger");
+        return;
+      }
+      LM.toast((created > 1 ? created + " demandes enregistrées" : "Demande enregistrée") + " et planning mis à jour pour " + plural(toUpsert.length, "jour") + "." +
+        (nbIgnores ? " " + plural(nbIgnores, "jour") + " antérieur" + (nbIgnores > 1 ? "s" : "") + " à l'embauche ignoré" + (nbIgnores > 1 ? "s" : "") + " dans le planning." : ""), "success");
+      LM.closeModal();
+      render(document.getElementById("content"));
+    }
+  }
 
   // ------------------------------------------------------------------
   // Fenêtre récapitulative d'un livreur : ouverte au clic sur son nom dans la grille du
@@ -13133,155 +13557,70 @@
 
   // ------------------------------------------------------------------
   // Pop-up "Gérer les retards" pour une entrée du journal : nombre de livraisons en retard et
-  // clients concernés. Si un client tapé n'existe pas encore dans l'annuaire, propose de le
-  // créer directement (sans quitter cette pop-up) via un petit formulaire qui apparaît en ligne.
+  // clients concernés. Présentation identique au pop-up « Saisie manuelle » d'Analyse : clients à
+  // gauche (recherche + cartes), détail du client sélectionné à droite. Un client inconnu peut être
+  // créé sans quitter la pop-up (formulaire dans le volet de droite).
   // ------------------------------------------------------------------
   function openRetardForm(livraisonRow, onSaved) {
     var existing = DB.retardPourLivraison(livraisonRow.id);
+    var maxN = Number(livraisonRow.nbLivraisons) || 0;
+    var nbAvance = Number(livraisonRow.nbEnAvance) || 0;
+    var nbALHeure = Number(livraisonRow.nbALHeure) || 0;
+    var PRESETS = [5, 10, 15, 30, 45, 60];
+
+    // Brouillon : chaque client porte son temps de retard, son créneau de commande et jusqu'à
+    // 3 justificatifs (liste personnalisable depuis Annexes).
+    var selectedClients = (existing && Array.isArray(existing.clients)) ? existing.clients.map(function (c) {
+      return { clientId: c.clientId, tempsRetard: (c.tempsRetard != null ? c.tempsRetard : null), heureDebut: c.heureDebut || "", heureFin: c.heureFin || "", justifications: Array.isArray(c.justifications) ? c.justifications.slice() : [] };
+    }) : [];
+    var aucunRetard = !!(existing && existing.aucunRetard);
+    var nbRetards = existing ? (Number(existing.nbLivraisonsRetard) || 0) : 0;
+    var commentaire = existing ? (existing.commentaire || "") : "";
+    var activeId = selectedClients.length ? selectedClients[0].clientId : null;
+    var creating = null; // { nom } quand le formulaire « nouveau client » est affiché à droite
+    var pendingRm = null;
+    var modalEl = null;
+
+    function q(sel) { return modalEl.querySelector(sel); }
+    function find(id) { for (var i = 0; i < selectedClients.length; i++) { if (selectedClients[i].clientId === id) return selectedClients[i]; } return null; }
+    function plural(n, w) { return n + " " + w + (n > 1 ? "s" : ""); }
+    function distTxt(c) { return (c && c.distanceKm !== "" && c.distanceKm != null && isFinite(Number(c.distanceKm))) ? DB.fmtNum(Number(c.distanceKm)) + " km" : ""; }
+    function addrTxt(c) { return c ? [c.adresse, c.codePostal, c.ville].filter(Boolean).join(" ") : ""; }
+    function creneauTxt(sc) { return (sc.heureDebut || sc.heureFin) ? (sc.heureDebut || "?") + "–" + (sc.heureFin || "?") : ""; }
 
     LM.openModal({
       title: "Retards — " + DB.fmtDate(livraisonRow.date),
       wide: true,
       bodyHtml:
-        '<form id="retForm">' +
-          '<div class="card" style="background:var(--color-surface-alt);margin-bottom:16px;">' +
-            '<p class="text-sm" style="margin:0 0 4px;"><strong>' + LM.escapeHtml(entrepotLabel(livraisonRow)) + '</strong>' + (livraisonRow.livreurId || livraisonRow.livreurNom ? ' — ' + LM.escapeHtml(livreurLabel(livraisonRow)) : '') + '</p>' +
-            '<p class="text-sm text-faint" style="margin:0;">' + DB.fmtNum(livraisonRow.nbLivraisons) + ' livraison(s) au total sur cette entrée.</p>' +
-          '</div>' +
-          '<label class="checkbox-row" style="margin-bottom:16px;"><input type="checkbox" id="retAucunCb"' + (existing && existing.aucunRetard ? " checked" : "") + ' /><span>Aucun retard sur cette entrée</span></label>' +
-          '<div id="retDetailsSection"' + (existing && existing.aucunRetard ? ' style="display:none;"' : '') + '>' +
-            '<div class="field"><label>Nombre de livraisons en retard sur cette entrée</label>' +
-              '<input type="number" name="nbLivraisonsRetard" min="0" max="' + (Number(livraisonRow.nbLivraisons) || 0) + '" value="' + (existing ? existing.nbLivraisonsRetard : 0) + '" />' +
-            '</div>' +
-            '<div class="field">' +
-              '<label>Clients ayant eu du retard</label>' +
-              '<p class="text-sm text-faint" style="margin-top:-4px;">Pour chaque client ajouté, précisez son temps de retard et jusqu\'à 3 justificatifs (liste personnalisable depuis Annexes).</p>' +
-              '<div class="form-row" style="align-items:flex-end;margin-bottom:8px;">' +
-                '<div class="field mb-0 client-search-field" style="flex:2;">' +
-                  '<input type="text" id="retClientInput" placeholder="Rechercher par nom, adresse ou téléphone…" autocomplete="off" />' +
-                  '<div id="retClientResults" class="client-search-results"></div>' +
-                '</div>' +
-                '<div class="field mb-0"><button type="button" class="btn btn-secondary btn-sm" id="btnAddRetClient">' + LM.icon("plus") + ' Ajouter</button></div>' +
-              '</div>' +
-              '<div id="retNewClientPanel" class="card" style="display:none;margin-bottom:12px;background:var(--color-surface-alt);">' +
-                '<p class="text-sm" style="margin-top:0;">Ce client n\'existe pas encore dans l\'annuaire. Renseignez ses informations pour l\'ajouter : une fois créé, il sera placé en tête de la liste ci-dessous.</p>' +
-                '<div class="field"><label>Nom du client *</label><input type="text" id="ncNom" /></div>' +
-                '<div class="form-row">' +
-                  '<div class="field"><label>Contact référent</label><input type="text" id="ncContact" /></div>' +
-                  '<div class="field"><label>Téléphone</label><input type="text" id="ncTelephone" /></div>' +
-                '</div>' +
-                '<div class="field"><label>Adresse</label><input type="text" id="ncAdresse" placeholder="N°, rue…" /></div>' +
-                '<div class="form-row">' +
-                  '<div class="field"><label>Ville</label><input type="text" id="ncVille" /></div>' +
-                  '<div class="field"><label>Distance (km)</label><input type="text" inputmode="decimal" id="ncDistance" placeholder="Ex : 12,5" /></div>' +
-                '</div>' +
-                '<div class="flex gap-10">' +
-                  '<button type="button" class="btn btn-primary btn-sm" id="btnCreateNewClient">' + LM.icon("check") + ' Créer et ajouter</button>' +
-                  '<button type="button" class="btn btn-ghost btn-sm" id="btnCancelNewClient">Annuler</button>' +
-                '</div>' +
-              '</div>' +
-              '<div id="retClientChips"></div>' +
-            '</div>' +
-          '</div>' +
-          '<div class="field"><label>Commentaire</label><textarea name="commentaire" placeholder="Optionnel">' + LM.escapeHtml(existing ? (existing.commentaire || "") : "") + '</textarea></div>' +
-        '</form>',
+        '<div class="rt-context">' +
+          '<span class="rt-ctx-main">' + LM.icon("entrepot") + ' <strong>' + LM.escapeHtml(entrepotLabel(livraisonRow)) + '</strong></span>' +
+          ((livraisonRow.livreurId || livraisonRow.livreurNom) ? '<span class="rt-ctx-item">' + LM.icon("livreur") + ' ' + LM.escapeHtml(livreurLabel(livraisonRow)) + '</span>' : '') +
+          '<span class="rt-ctx-item"><strong>' + DB.fmtNum(maxN) + '</strong> livraison' + (maxN > 1 ? 's' : '') + '</span>' +
+          (nbAvance ? '<span class="badge badge-info">' + DB.fmtNum(nbAvance) + ' en avance</span>' : '') +
+          (nbALHeure ? '<span class="badge badge-success">' + DB.fmtNum(nbALHeure) + ' à l\'heure</span>' : '') +
+        '</div>' +
+        '<div class="rt-bar">' +
+          '<label class="checkbox-row rt-none"><input type="checkbox" id="rtNone"' + (aucunRetard ? ' checked' : '') + ' /><span>Aucun retard sur cette entrée</span></label>' +
+          '<div class="field mb-0 rt-nb" id="rtNbWrap"><label>Livraisons en retard</label><input type="number" id="rtNb" min="0" max="' + maxN + '" value="' + nbRetards + '" /></div>' +
+          '<div class="field mb-0 rt-comment"><label>Commentaire <span class="text-faint" style="font-weight:500;">(optionnel)</span></label><input type="text" id="rtComment" value="' + LM.escapeHtml(commentaire) + '" placeholder="ex : route barrée, panne du véhicule…" /></div>' +
+        '</div>' +
+        '<div class="sm-ent-hint rt-hint" id="rtHint"></div>' +
+        '<div id="rtBody"></div>',
       footerHtml:
-        '<button class="btn btn-secondary" id="cancelBtn">Annuler</button>' +
-        (existing ? '<button class="btn btn-danger" id="deleteBtn">Supprimer le signalement</button>' : '') +
-        '<button class="btn btn-primary" id="saveBtn">Enregistrer</button>',
+        '<span class="sm-summary" id="rtSummary"></span>' +
+        (existing ? '<button type="button" class="btn btn-danger" id="rtDelete">Supprimer le signalement</button>' : '') +
+        '<button type="button" class="btn btn-secondary" id="rtCancel">Annuler</button>' +
+        '<button type="button" class="btn btn-primary" id="rtSave">' + LM.icon("check") + ' Enregistrer</button>',
       onMount: function (modal) {
-        // Chaque client sélectionné porte son propre temps de retard (minutes) et jusqu'à 3
-        // justificatifs choisis dans la liste personnalisable de la page Annexes.
-        var selectedClients = (existing && Array.isArray(existing.clients)) ? existing.clients.map(function (c) {
-          return { clientId: c.clientId, tempsRetard: (c.tempsRetard != null ? c.tempsRetard : null), heureDebut: c.heureDebut || "", heureFin: c.heureFin || "", justifications: Array.isArray(c.justifications) ? c.justifications.slice() : [] };
-        }) : [];
-        renderChips();
-
-        var clientInput = modal.querySelector("#retClientInput");
-        var clientResults = modal.querySelector("#retClientResults");
-
-        // Ajoute un client en tête de liste (le dernier ajouté doit toujours apparaître en
-        // premier), qu'il vienne d'un résultat de recherche, du bouton "Ajouter" ou de la
-        // création d'une nouvelle fiche client.
-        function addSelectedClient(clientId) {
-          if (selectedClients.some(function (sc) { return sc.clientId === clientId; })) {
-            LM.toast("Ce client est déjà dans la liste.", "info");
-            return false;
-          }
-          selectedClients.unshift({ clientId: clientId, tempsRetard: null, heureDebut: "", heureFin: "", justifications: [] });
-          renderChips();
-          return true;
-        }
-
-        function hideClientResults() {
-          clientResults.style.display = "none";
-          clientResults.innerHTML = "";
-        }
-
-        function renderClientResults(query) {
-          var q = DB.normalizeStr(query);
-          if (!q) { hideClientResults(); return; }
-          var matches = DB.list("clients").filter(function (c) {
-            return DB.normalizeStr(c.nom).indexOf(q) !== -1 ||
-              DB.normalizeStr(c.adresse || "").indexOf(q) !== -1 ||
-              DB.normalizeStr(c.ville || "").indexOf(q) !== -1 ||
-              DB.normalizeStr(c.telephone || "").indexOf(q) !== -1;
-          }).sort(function (a, b) {
-            // Priorité aux noms qui commencent par la recherche, puis ordre alphabétique.
-            var an = DB.normalizeStr(a.nom), bn = DB.normalizeStr(b.nom);
-            var aStarts = an.indexOf(q) === 0 ? 0 : 1, bStarts = bn.indexOf(q) === 0 ? 0 : 1;
-            if (aStarts !== bStarts) return aStarts - bStarts;
-            return an.localeCompare(bn, "fr");
-          }).slice(0, 8);
-
-          if (!matches.length) {
-            clientResults.innerHTML = '<div class="client-search-empty">Aucun client ne correspond à « ' + LM.escapeHtml(query) + ' ». Cliquez sur « Ajouter » pour en créer un nouveau.</div>';
-            clientResults.style.display = "block";
-            return;
-          }
-
-          clientResults.innerHTML = matches.map(function (c) {
-            var addr = [c.adresse, c.codePostal, c.ville].filter(Boolean).join(" ");
-            var already = selectedClients.some(function (sc) { return sc.clientId === c.id; });
-            return '<div class="client-search-item' + (already ? " is-added" : "") + '" data-pick-client="' + c.id + '">' +
-              '<div class="csi-name">' + LM.escapeHtml(c.nom) + (already ? ' <span class="csi-added-badge">Déjà ajouté</span>' : '') + '</div>' +
-              '<div class="csi-meta">' +
-                (addr ? '<span class="csi-meta-item">' + LM.icon("zones") + LM.escapeHtml(addr) + '</span>' : '<span class="csi-meta-item csi-meta-empty">' + LM.icon("zones") + 'Adresse non renseignée</span>') +
-                (c.telephone ? '<span class="csi-meta-item">' + LM.icon("phone") + LM.escapeHtml(c.telephone) + '</span>' : '<span class="csi-meta-item csi-meta-empty">' + LM.icon("phone") + 'Téléphone non renseigné</span>') +
-              '</div>' +
-            '</div>';
-          }).join("");
-          clientResults.style.display = "block";
-
-          clientResults.querySelectorAll("[data-pick-client]").forEach(function (item) {
-            // "mousedown" (et non "click") pour s'exécuter avant le "blur" de l'input qui masque
-            // la liste, sans quoi le clic sur un résultat ne serait jamais reçu.
-            item.addEventListener("mousedown", function (e) {
-              e.preventDefault();
-              var id = item.getAttribute("data-pick-client");
-              if (addSelectedClient(id)) {
-                clientInput.value = "";
-                hideClientResults();
-              } else {
-                renderClientResults(clientInput.value);
-              }
-            });
-          });
-        }
-
-        clientInput.addEventListener("input", function () { renderClientResults(clientInput.value); });
-        clientInput.addEventListener("focus", function () { if (clientInput.value.trim()) renderClientResults(clientInput.value); });
-        clientInput.addEventListener("blur", function () { setTimeout(hideClientResults, 120); });
-        clientInput.addEventListener("keydown", function (e) { if (e.key === "Escape") hideClientResults(); });
-
-        modal.querySelector("#retAucunCb").addEventListener("change", function (e) {
-          modal.querySelector("#retDetailsSection").style.display = e.target.checked ? "none" : "";
-        });
-
-        modal.querySelector("#cancelBtn").addEventListener("click", LM.closeModal);
-
+        modalEl = modal;
+        modal.classList.add("modal-saisie");
+        q("#rtNone").addEventListener("change", function (e) { aucunRetard = e.target.checked; renderBody(); renderMeta(); });
+        q("#rtNb").addEventListener("input", function (e) { var v = Number(e.target.value); nbRetards = (e.target.value === "" || !isFinite(v) || v < 0) ? 0 : v; renderMeta(); });
+        q("#rtComment").addEventListener("input", function (e) { commentaire = e.target.value; });
+        q("#rtCancel").addEventListener("click", LM.closeModal);
+        q("#rtSave").addEventListener("click", save);
         if (existing) {
-          modal.querySelector("#deleteBtn").addEventListener("click", function () {
+          q("#rtDelete").addEventListener("click", function () {
             LM.confirmDialog("Supprimer ce signalement de retard ?", function () {
               DB.removeRetard(livraisonRow.id);
               DB.logHistorique("Retards", "suppression", "Suppression signalement de retard : livraison du " + DB.fmtDate(livraisonRow.date) + " (" + (livraisonRow.livreurNom || "livreur inconnu") + ")");
@@ -13291,201 +13630,296 @@
             });
           });
         }
-
-        modal.querySelector("#btnAddRetClient").addEventListener("click", function () {
-          var input = modal.querySelector("#retClientInput");
-          var name = input.value.toString().trim();
-          if (!name) return;
-          var match = DB.resolveClientByName(name);
-          if (match) {
-            addSelectedClient(match.id);
-            input.value = "";
-            hideClientResults();
-          } else {
-            modal.querySelector("#ncNom").value = name;
-            modal.querySelector("#ncContact").value = "";
-            modal.querySelector("#ncTelephone").value = "";
-            modal.querySelector("#ncAdresse").value = "";
-            modal.querySelector("#ncVille").value = "";
-            modal.querySelector("#ncDistance").value = "";
-            modal.querySelector("#retNewClientPanel").style.display = "block";
-            hideClientResults();
-          }
-        });
-
-        modal.querySelector("#btnCancelNewClient").addEventListener("click", function () {
-          modal.querySelector("#retNewClientPanel").style.display = "none";
-        });
-
-        modal.querySelector("#btnCreateNewClient").addEventListener("click", function () {
-          var nom = modal.querySelector("#ncNom").value.toString().trim();
-          if (!nom) { LM.toast("Le nom du client est obligatoire.", "danger"); return; }
-          var distRaw = modal.querySelector("#ncDistance").value.toString().trim().replace(",", ".");
-          var distKm = "";
-          if (distRaw !== "") {
-            var dn = Number(distRaw);
-            if (isNaN(dn) || dn < 0) { LM.toast("La distance doit être un nombre positif (en km).", "danger"); return; }
-            distKm = Math.round(dn * 100) / 100;
-          }
-          var already = DB.resolveClientByName(nom);
-          if (already) {
-            addSelectedClient(already.id);
-            LM.toast("Ce client existait déjà : ajouté à la liste.", "info");
-          } else {
-            var created = DB.add("clients", {
-              nom: nom,
-              contact: modal.querySelector("#ncContact").value.toString().trim(),
-              telephone: modal.querySelector("#ncTelephone").value.toString().trim(),
-              email: "",
-              adresse: modal.querySelector("#ncAdresse").value.toString().trim(),
-              codePostal: "",
-              ville: modal.querySelector("#ncVille").value.toString().trim(),
-              distanceKm: distKm,
-              notes: ""
-            });
-            addSelectedClient(created.id);
-            DB.logHistorique("Clients", "ajout", "Ajout client : " + nom);
-            LM.toast("Client « " + nom + " » créé et ajouté.", "success");
-          }
-          modal.querySelector("#retClientInput").value = "";
-          modal.querySelector("#retNewClientPanel").style.display = "none";
-          hideClientResults();
-          renderChips();
-        });
-
-        modal.querySelector("#saveBtn").addEventListener("click", function () {
-          var fd = new FormData(modal.querySelector("#retForm"));
-          var aucunRetard = modal.querySelector("#retAucunCb").checked;
-          var n = 0;
-          if (!aucunRetard) {
-            n = Number(fd.get("nbLivraisonsRetard"));
-            if (!isFinite(n) || n < 0) n = 0;
-            var maxN = Number(livraisonRow.nbLivraisons) || 0;
-            if (n > maxN) { LM.toast("Le nombre de retards ne peut pas dépasser le nombre de livraisons de cette entrée (" + maxN + ").", "danger"); return; }
-          }
-          if (!aucunRetard) {
-            var badHeure = selectedClients.filter(function (sc) { return sc.heureDebut && sc.heureFin && sc.heureFin <= sc.heureDebut; })[0];
-            if (badHeure) { LM.toast("L'heure de fin de commande doit être postérieure à l'heure de début (" + (DB.clientNom(badHeure.clientId) || "client") + ").", "danger"); return; }
-          }
-          var patch = {
-            nbLivraisonsRetard: n,
-            aucunRetard: aucunRetard,
-            clients: aucunRetard ? [] : selectedClients.map(function (sc) {
-              return { clientId: sc.clientId, tempsRetard: sc.tempsRetard, heureDebut: sc.heureDebut || "", heureFin: sc.heureFin || "", justifications: (sc.justifications || []).slice() };
-            }),
-            commentaire: (fd.get("commentaire") || "").toString().trim()
-          };
-          DB.upsertRetard(livraisonRow.id, patch);
-          DB.logHistorique("Retards", existing ? "modification" : "ajout", (existing ? "Modification" : "Ajout") + " signalement de retard : livraison du " + DB.fmtDate(livraisonRow.date) + " (" + (livraisonRow.livreurNom || "livreur inconnu") + ") -> " + (aucunRetard ? "aucun retard" : (n + " en retard")));
-          LM.toast("Retard enregistré.", "success");
-          LM.closeModal();
-          if (typeof onSaved === "function") onSaved();
-        });
-
-        function renderChips() {
-          var wrap = modal.querySelector("#retClientChips");
-          if (!selectedClients.length) {
-            wrap.innerHTML = '<span class="text-faint text-sm">Aucun client sélectionné.</span>';
-            return;
-          }
-          wrap.innerHTML = selectedClients.map(function (sc) {
-            var nom = DB.clientNom(sc.clientId) || "Client supprimé";
-            var justifs = Array.isArray(sc.justifications) ? sc.justifications : [];
-            var motifOptions = DB.listeItems("motifsRetard").filter(function (m) { return justifs.indexOf(m.key) === -1; });
-            var chipsHtml = justifs.length ? justifs.map(function (key) {
-              var label = DB.listeLabel("motifsRetard", key) || "Justificatif supprimé";
-              return '<span class="date-chip">' + LM.escapeHtml(label) + '<button type="button" data-rmmotif="' + sc.clientId + '|' + key + '">' + LM.icon("close") + '</button></span>';
-            }).join("") : '<span class="text-faint text-sm">Aucun justificatif renseigné.</span>';
-            return '<div class="card" style="background:var(--color-surface-alt);padding:12px;margin-bottom:10px;">' +
-              '<div class="flex-between" style="margin-bottom:8px;">' +
-                '<strong>' + LM.escapeHtml(nom) + '</strong>' +
-                '<button type="button" class="btn btn-ghost btn-sm btn-icon" data-rmclient="' + sc.clientId + '" title="Retirer ce client">' + LM.icon("close") + '</button>' +
-              '</div>' +
-              '<div class="form-row" style="align-items:flex-start;margin-bottom:10px;">' +
-                '<div class="field mb-0">' +
-                  '<label>Temps de retard (minutes)</label>' +
-                  '<input type="number" min="0" data-temps="' + sc.clientId + '" value="' + (sc.tempsRetard != null ? sc.tempsRetard : "") + '" />' +
-                '</div>' +
-                '<div class="field mb-0">' +
-                  '<label>Début de commande</label>' +
-                  '<input type="time" data-hdeb="' + sc.clientId + '" value="' + LM.escapeHtml(sc.heureDebut || "") + '" />' +
-                '</div>' +
-                '<div class="field mb-0">' +
-                  '<label>Fin de commande</label>' +
-                  '<input type="time" data-hfin="' + sc.clientId + '" value="' + LM.escapeHtml(sc.heureFin || "") + '" />' +
-                '</div>' +
-              '</div>' +
-              '<div class="field mb-0">' +
-                '<label>Justificatifs (3 maximum)</label>' +
-                (justifs.length < 3 ?
-                  '<div class="form-row" style="align-items:flex-end;margin-bottom:8px;">' +
-                    '<div class="field mb-0" style="flex:2;"><select data-motif-select="' + sc.clientId + '">' +
-                      '<option value="">Choisir un justificatif…</option>' +
-                      motifOptions.map(function (m) { return '<option value="' + m.key + '">' + LM.escapeHtml(m.label) + '</option>'; }).join("") +
-                    '</select></div>' +
-                    '<div class="field mb-0"><button type="button" class="btn btn-secondary btn-sm" data-add-motif="' + sc.clientId + '">' + LM.icon("plus") + ' Ajouter</button></div>' +
-                  '</div>'
-                  : '<p class="text-sm text-faint" style="margin:0 0 8px;">Maximum de 3 justificatifs atteint.</p>') +
-                '<div class="date-chip-list">' + chipsHtml + '</div>' +
-              '</div>' +
-            '</div>';
-          }).join("");
-
-          wrap.querySelectorAll("[data-rmclient]").forEach(function (btn) {
-            btn.addEventListener("click", function () {
-              var id = btn.getAttribute("data-rmclient");
-              selectedClients = selectedClients.filter(function (sc) { return sc.clientId !== id; });
-              renderChips();
-            });
-          });
-          wrap.querySelectorAll("[data-temps]").forEach(function (input) {
-            input.addEventListener("input", function () {
-              var id = input.getAttribute("data-temps");
-              var sc = selectedClients.filter(function (x) { return x.clientId === id; })[0];
-              if (!sc) return;
-              var v = Number(input.value);
-              sc.tempsRetard = (input.value === "" || !isFinite(v) || v < 0) ? null : v;
-            });
-          });
-          [["data-hdeb", "heureDebut"], ["data-hfin", "heureFin"]].forEach(function (pair) {
-            wrap.querySelectorAll("[" + pair[0] + "]").forEach(function (input) {
-              input.addEventListener("input", function () {
-                var id = input.getAttribute(pair[0]);
-                var sc = selectedClients.filter(function (x) { return x.clientId === id; })[0];
-                if (sc) sc[pair[1]] = input.value || "";
-              });
-            });
-          });
-          wrap.querySelectorAll("[data-add-motif]").forEach(function (btn) {
-            btn.addEventListener("click", function () {
-              var id = btn.getAttribute("data-add-motif");
-              var select = wrap.querySelector('select[data-motif-select="' + id + '"]');
-              var key = select ? select.value : "";
-              if (!key) { LM.toast("Choisissez un justificatif dans la liste.", "info"); return; }
-              var sc = selectedClients.filter(function (x) { return x.clientId === id; })[0];
-              if (!sc) return;
-              if (!Array.isArray(sc.justifications)) sc.justifications = [];
-              if (sc.justifications.length >= 3) { LM.toast("Maximum de 3 justificatifs par client.", "danger"); return; }
-              if (sc.justifications.indexOf(key) !== -1) { LM.toast("Ce justificatif est déjà sélectionné.", "info"); return; }
-              sc.justifications.push(key);
-              renderChips();
-            });
-          });
-          wrap.querySelectorAll("[data-rmmotif]").forEach(function (btn) {
-            btn.addEventListener("click", function () {
-              var parts = btn.getAttribute("data-rmmotif").split("|");
-              var id = parts[0], key = parts[1];
-              var sc = selectedClients.filter(function (x) { return x.clientId === id; })[0];
-              if (sc && Array.isArray(sc.justifications)) {
-                sc.justifications = sc.justifications.filter(function (k) { return k !== key; });
-              }
-              renderChips();
-            });
-          });
-        }
-
+        renderBody();
+        renderMeta();
       }
     });
+
+    // ---------------------------------------------------------------- bandeau, aide et résumé
+    function renderMeta() {
+      q("#rtNbWrap").style.display = aucunRetard ? "none" : "";
+      var hint = q("#rtHint");
+      if (aucunRetard) { hint.innerHTML = '<span class="sm-ent-hint-ok">Cette entrée sera enregistrée « sans retard ».</span>'; }
+      else if (nbRetards > maxN) { hint.innerHTML = '<span class="sm-ent-hint-bad">Plus de retards (' + nbRetards + ') que de livraisons sur cette entrée (' + maxN + ').</span>'; }
+      else if (selectedClients.length > nbRetards) {
+        hint.innerHTML = plural(selectedClients.length, "client") + ' saisi' + (selectedClients.length > 1 ? 's' : '') + ' pour ' + plural(nbRetards, "retard") + ' déclaré' + (nbRetards > 1 ? 's' : '') + '. ' +
+          (selectedClients.length <= maxN ? '<button type="button" class="sm-link" id="rtFixNb">Déclarer ' + plural(selectedClients.length, "retard") + '</button>' : '');
+        var fx = q("#rtFixNb");
+        if (fx) fx.addEventListener("click", function () { nbRetards = selectedClients.length; q("#rtNb").value = nbRetards; renderMeta(); });
+      } else if (nbRetards === 0 && !selectedClients.length) { hint.innerHTML = 'Indiquez le nombre de livraisons en retard, puis ajoutez les clients concernés.'; }
+      else { hint.innerHTML = '<span class="sm-ent-hint-ok">' + plural(nbRetards, "retard") + ' sur ' + plural(maxN, "livraison") + (selectedClients.length ? ' ✓' : '') + '</span>'; }
+
+      var withTime = selectedClients.filter(function (sc) { return sc.tempsRetard != null; });
+      var avg = withTime.length ? Math.round(withTime.reduce(function (s, sc) { return s + sc.tempsRetard; }, 0) / withTime.length) : null;
+      var mx = withTime.length ? Math.max.apply(null, withTime.map(function (sc) { return sc.tempsRetard; })) : null;
+      q("#rtSummary").innerHTML = aucunRetard ? '<strong>Aucun retard</strong>' :
+        '<strong>' + plural(selectedClients.length, "client") + '</strong>' + (avg != null ? ' · retard moyen <strong>' + avg + ' min</strong> · maximum <strong>' + mx + ' min</strong>' : '');
+    }
+
+    // ---------------------------------------------------------------- corps : clients (gauche) / détail (droite)
+    function renderBody() {
+      var body = q("#rtBody");
+      if (aucunRetard) {
+        body.innerHTML = '<div class="sm-frame rt-none-frame"><div class="sm-empty">Cette entrée est marquée « sans retard ».<br />Décochez la case ci-dessus pour saisir des clients en retard.</div></div>';
+        return;
+      }
+      body.innerHTML =
+        '<div class="sm-cols">' +
+          '<div class="sm-col">' +
+            '<label class="sm-label">Clients en retard</label>' +
+            '<div class="sm-search"><span class="sm-search-ic">' + LM.icon("search") + '</span><input type="text" class="sm-input" id="rtClientSearch" placeholder="Rechercher par nom, adresse ou téléphone…" autocomplete="off" /><div class="sm-drop" id="rtClientDrop" hidden></div></div>' +
+            '<div class="sm-frame" id="rtCards"></div>' +
+          '</div>' +
+          '<div class="sm-col" id="rtRight"></div>' +
+        '</div>';
+      renderCards();
+      renderRight();
+      LM.searchDrop(q("#rtClientSearch"), q("#rtClientDrop"), clientItems, pickClient, { extra: newClientExtra });
+    }
+
+    function clientItems() {
+      return DB.list("clients").filter(function (c) { return !find(c.id); }).map(function (c) {
+        var bits = [addrTxt(c), distTxt(c)].filter(Boolean);
+        return { id: c.id, label: c.nom, sub: bits.join(" · "), hay: [c.adresse, c.ville, c.codePostal, c.telephone, c.contact].filter(Boolean).join(" ") };
+      }).sort(function (a, b) { return a.label.localeCompare(b.label, "fr"); });
+    }
+    function newClientExtra(raw) {
+      var name = (raw || "").toString().trim();
+      if (!name || DB.resolveClientByName(name)) return [];
+      return [{ id: "__new__", extra: true, label: "Créer le client « " + name + " »", sub: "Nouvelle fiche dans l'annuaire", newName: name }];
+    }
+    function pickClient(item) {
+      q("#rtClientSearch").value = "";
+      if (item.id === "__new__") { creating = { nom: item.newName }; pendingRm = null; renderCards(); renderRight(); var n = q("#ncNom"); if (n) { n.focus(); n.select(); } return; }
+      addClient(item.id);
+    }
+    function addClient(id) {
+      if (find(id)) { activeId = id; renderCards(); renderRight(); return; }
+      selectedClients.unshift({ clientId: id, tempsRetard: null, heureDebut: "", heureFin: "", justifications: [] });
+      activeId = id; creating = null; pendingRm = null;
+      renderCards(); renderRight(); renderMeta();
+      var t = q("#rtTemps"); if (t) t.focus();
+    }
+
+    function renderCards() {
+      var frame = q("#rtCards");
+      if (!frame) return;
+      if (!selectedClients.length) {
+        frame.innerHTML = '<div class="sm-empty">Aucun client pour cette entrée.<br />Recherchez un client ci-dessus pour l\'ajouter.</div>';
+        return;
+      }
+      frame.innerHTML = selectedClients.map(function (sc) {
+        var c = DB.get("clients", sc.clientId);
+        var nom = c ? c.nom : "Client supprimé";
+        var bits = [];
+        if (sc.tempsRetard != null) bits.push(sc.tempsRetard + " min");
+        if (creneauTxt(sc)) bits.push(creneauTxt(sc));
+        if (sc.justifications.length) bits.push(plural(sc.justifications.length, "justificatif"));
+        var armed = pendingRm === sc.clientId;
+        return '<div class="sm-liv' + (sc.clientId === activeId && !creating ? ' active' : '') + (sc.tempsRetard == null ? ' sm-liv-empty' : '') + '" data-rtcl="' + sc.clientId + '" tabindex="0" role="button">' +
+          '<div class="sm-liv-main"><span class="sm-liv-name">' + LM.escapeHtml(nom) + '</span>' +
+          '<span class="sm-liv-meta">' + (bits.length ? LM.escapeHtml(bits.join(" · ")) : 'Temps de retard à renseigner') + '</span></div>' +
+          (armed ? '<button type="button" class="sm-x sm-x-confirm" data-rtclrm="' + sc.clientId + '">Retirer ?</button>'
+                 : '<button type="button" class="sm-x" data-rtclrm="' + sc.clientId + '" title="Retirer ce client">' + LM.icon("close") + '</button>') +
+          '</div>';
+      }).join("");
+      frame.querySelectorAll("[data-rtcl]").forEach(function (card) {
+        function select() { activeId = card.getAttribute("data-rtcl"); creating = null; pendingRm = null; renderCards(); renderRight(); }
+        card.addEventListener("click", select);
+        card.addEventListener("keydown", function (e) { if (e.target === card && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); select(); } });
+      });
+      frame.querySelectorAll("[data-rtclrm]").forEach(function (b) {
+        b.addEventListener("click", function (e) {
+          e.stopPropagation();
+          var id = b.getAttribute("data-rtclrm");
+          var sc = find(id);
+          if (!sc) return;
+          var hasData = sc.tempsRetard != null || sc.heureDebut || sc.heureFin || sc.justifications.length;
+          if (hasData && pendingRm !== id) { pendingRm = id; renderCards(); return; }
+          selectedClients = selectedClients.filter(function (x) { return x.clientId !== id; });
+          if (activeId === id) activeId = selectedClients.length ? selectedClients[0].clientId : null;
+          pendingRm = null;
+          renderCards(); renderRight(); renderMeta();
+        });
+      });
+    }
+
+    // ---------------------------------------------------------------- détail du client sélectionné
+    function renderRight() {
+      var host = q("#rtRight");
+      if (!host) return;
+      if (creating) { renderNewClient(host); return; }
+      var sc = activeId ? find(activeId) : null;
+      if (!sc) {
+        host.innerHTML = '<label class="sm-label">Détail du retard</label><div class="sm-frame"><div class="sm-empty">' + (selectedClients.length ? 'Cliquez sur un client dans le cadre de gauche<br />pour renseigner son retard.' : 'Ajoutez un client à gauche pour commencer.<br />Un client inconnu peut être créé directement.') + '</div></div>';
+        return;
+      }
+      var c = DB.get("clients", sc.clientId);
+      var info = [addrTxt(c), distTxt(c), c && c.telephone].filter(Boolean);
+      host.innerHTML =
+        '<label class="sm-label">Détail du retard <span class="sm-label-sub">— ' + LM.escapeHtml(c ? c.nom : "Client supprimé") + '</span></label>' +
+        '<div class="sm-frame rt-detail">' +
+          '<div class="rt-client-info">' + (info.length ? LM.escapeHtml(info.join("  ·  ")) : '<span class="text-faint">Aucune adresse renseignée pour ce client.</span>') + '</div>' +
+          '<div class="sm-ent"><div class="field mb-0"><label class="rt-lab">Temps de retard (minutes)</label>' +
+            '<input type="number" min="0" id="rtTemps" value="' + (sc.tempsRetard != null ? sc.tempsRetard : "") + '" placeholder="ex : 20" />' +
+            '<div class="rt-presets">' + PRESETS.map(function (m) { return '<button type="button" class="cl-chip' + (sc.tempsRetard === m ? ' active' : '') + '" data-rtpreset="' + m + '">' + m + ' min</button>'; }).join("") + '</div>' +
+          '</div></div>' +
+          '<div class="sm-ent"><div class="rt-two">' +
+            '<div class="field mb-0"><label class="rt-lab">Début de commande</label><input type="time" id="rtHdeb" value="' + LM.escapeHtml(sc.heureDebut || "") + '" /></div>' +
+            '<div class="field mb-0"><label class="rt-lab">Fin de commande</label><input type="time" id="rtHfin" value="' + LM.escapeHtml(sc.heureFin || "") + '" /></div>' +
+          '</div><div class="sm-ent-hint" id="rtCreneauHint"></div></div>' +
+          '<div class="sm-ent"><label class="rt-lab">Justificatifs <span class="text-faint" style="font-weight:500;">(3 maximum)</span></label>' +
+            '<div class="sm-search"><span class="sm-search-ic">' + LM.icon("search") + '</span><input type="text" class="sm-input" id="rtMotifSearch" autocomplete="off" placeholder="' + (sc.justifications.length >= 3 ? 'Maximum de 3 justificatifs atteint' : 'Rechercher un justificatif…') + '"' + (sc.justifications.length >= 3 ? ' disabled' : '') + ' /><div class="sm-drop" id="rtMotifDrop" hidden></div></div>' +
+            '<div class="rt-motifs" id="rtMotifs"></div>' +
+          '</div>' +
+          (selectedClients.length > 1 ? '<button type="button" class="btn btn-secondary btn-sm rt-copy" id="rtCopy" title="Reporte les justificatifs et le créneau de commande de ce client sur les autres clients (uniquement dans leurs champs vides)">' + LM.icon("copy") + ' Copier justificatifs et créneau vers les autres clients</button>' : '') +
+        '</div>';
+      renderMotifs(sc);
+      renderCreneauHint(sc);
+
+      var temps = q("#rtTemps");
+      temps.addEventListener("input", function () {
+        var v = Number(temps.value);
+        sc.tempsRetard = (temps.value === "" || !isFinite(v) || v < 0) ? null : v;
+        host.querySelectorAll("[data-rtpreset]").forEach(function (b) { b.classList.toggle("active", Number(b.getAttribute("data-rtpreset")) === sc.tempsRetard); });
+        renderCards(); renderMeta();
+      });
+      host.querySelectorAll("[data-rtpreset]").forEach(function (b) {
+        b.addEventListener("click", function () {
+          sc.tempsRetard = Number(b.getAttribute("data-rtpreset"));
+          temps.value = sc.tempsRetard;
+          host.querySelectorAll("[data-rtpreset]").forEach(function (x) { x.classList.toggle("active", x === b); });
+          renderCards(); renderMeta();
+        });
+      });
+      q("#rtHdeb").addEventListener("input", function (e) { sc.heureDebut = e.target.value || ""; renderCreneauHint(sc); renderCards(); });
+      q("#rtHfin").addEventListener("input", function (e) { sc.heureFin = e.target.value || ""; renderCreneauHint(sc); renderCards(); });
+      LM.searchDrop(q("#rtMotifSearch"), q("#rtMotifDrop"), function () {
+        return DB.listeItems("motifsRetard").filter(function (m) { return sc.justifications.indexOf(m.key) === -1; }).map(function (m) { return { id: m.key, label: m.label }; });
+      }, function (it) {
+        if (sc.justifications.length >= 3) return;
+        sc.justifications.push(it.id);
+        renderRight(); renderCards();
+        var ms = q("#rtMotifSearch"); if (ms && !ms.disabled) ms.focus();
+      });
+      var copy = q("#rtCopy");
+      if (copy) copy.addEventListener("click", function () {
+        var n = 0;
+        selectedClients.forEach(function (o) {
+          if (o === sc) return;
+          var touched = false;
+          sc.justifications.forEach(function (k) { if (o.justifications.length < 3 && o.justifications.indexOf(k) === -1) { o.justifications.push(k); touched = true; } });
+          if (!o.heureDebut && sc.heureDebut) { o.heureDebut = sc.heureDebut; touched = true; }
+          if (!o.heureFin && sc.heureFin) { o.heureFin = sc.heureFin; touched = true; }
+          if (touched) n++;
+        });
+        renderCards();
+        LM.toast(n ? "Informations copiées vers " + plural(n, "autre client") + "." : "Rien à copier (champs déjà remplis ou vides).", n ? "success" : "info");
+      });
+    }
+
+    function renderCreneauHint(sc) {
+      var h = q("#rtCreneauHint");
+      if (!h) return;
+      if (sc.heureDebut && sc.heureFin && sc.heureFin <= sc.heureDebut) h.innerHTML = '<span class="sm-ent-hint-bad">L\'heure de fin doit être postérieure à l\'heure de début.</span>';
+      else h.innerHTML = '<span class="text-faint">Créneau pendant lequel le client a passé / attendu sa commande (optionnel).</span>';
+    }
+
+    function renderMotifs(sc) {
+      var el = q("#rtMotifs");
+      if (!el) return;
+      if (!sc.justifications.length) { el.innerHTML = '<span class="text-faint text-sm">Aucun justificatif renseigné.</span>'; return; }
+      el.innerHTML = sc.justifications.map(function (k) {
+        return '<div class="rt-motif"><span>' + LM.escapeHtml(DB.listeLabel("motifsRetard", k) || "Justificatif supprimé") + '</span><button type="button" class="sm-x" data-rtmotifrm="' + LM.escapeHtml(k) + '" title="Retirer">' + LM.icon("close") + '</button></div>';
+      }).join("");
+      el.querySelectorAll("[data-rtmotifrm]").forEach(function (b) {
+        b.addEventListener("click", function () {
+          var k = b.getAttribute("data-rtmotifrm");
+          sc.justifications = sc.justifications.filter(function (x) { return x !== k; });
+          renderRight(); renderCards();
+        });
+      });
+    }
+
+    // ---------------------------------------------------------------- création d'un nouveau client (volet de droite)
+    function renderNewClient(host) {
+      host.innerHTML =
+        '<label class="sm-label">Nouveau client</label>' +
+        '<div class="sm-frame rt-detail">' +
+          '<p class="text-sm" style="margin:0;">Ce client n\'existe pas encore dans l\'annuaire. Une fois créé, il sera ajouté à la liste de gauche.</p>' +
+          '<div class="sm-ent">' +
+            '<div class="field"><label>Nom du client *</label><input type="text" id="ncNom" value="' + LM.escapeHtml(creating.nom || "") + '" /></div>' +
+            '<div class="rt-two"><div class="field"><label>Contact référent</label><input type="text" id="ncContact" /></div><div class="field"><label>Téléphone</label><input type="text" id="ncTelephone" /></div></div>' +
+            '<div class="field"><label>Adresse</label><input type="text" id="ncAdresse" placeholder="N°, rue…" /></div>' +
+            '<div class="rt-two"><div class="field mb-0"><label>Ville</label><input type="text" id="ncVille" /></div><div class="field mb-0"><label>Distance (km)</label><input type="text" inputmode="decimal" id="ncDistance" placeholder="Ex : 12,5" /></div></div>' +
+          '</div>' +
+          '<div class="flex gap-10"><button type="button" class="btn btn-primary btn-sm" id="btnCreateNewClient">' + LM.icon("check") + ' Créer et ajouter</button><button type="button" class="btn btn-ghost btn-sm" id="btnCancelNewClient">Annuler</button></div>' +
+        '</div>';
+      q("#btnCancelNewClient").addEventListener("click", function () { creating = null; renderCards(); renderRight(); });
+      host.querySelectorAll("input").forEach(function (inp) {
+        inp.addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); q("#btnCreateNewClient").click(); } });
+      });
+      q("#btnCreateNewClient").addEventListener("click", function () {
+        var nom = q("#ncNom").value.toString().trim();
+        if (!nom) { LM.toast("Le nom du client est obligatoire.", "danger"); return; }
+        var distRaw = q("#ncDistance").value.toString().trim().replace(",", ".");
+        var distKm = "";
+        if (distRaw !== "") {
+          var dn = Number(distRaw);
+          if (isNaN(dn) || dn < 0) { LM.toast("La distance doit être un nombre positif (en km).", "danger"); return; }
+          distKm = Math.round(dn * 100) / 100;
+        }
+        var already = DB.resolveClientByName(nom);
+        if (already) {
+          LM.toast("Ce client existait déjà : ajouté à la liste.", "info");
+          creating = null; addClient(already.id);
+          return;
+        }
+        var created = DB.add("clients", {
+          nom: nom,
+          contact: q("#ncContact").value.toString().trim(),
+          telephone: q("#ncTelephone").value.toString().trim(),
+          email: "",
+          adresse: q("#ncAdresse").value.toString().trim(),
+          codePostal: "",
+          ville: q("#ncVille").value.toString().trim(),
+          distanceKm: distKm,
+          notes: ""
+        });
+        DB.logHistorique("Clients", "ajout", "Ajout client : " + nom);
+        LM.toast("Client « " + nom + " » créé et ajouté.", "success");
+        creating = null;
+        addClient(created.id);
+      });
+    }
+
+    // ---------------------------------------------------------------- enregistrement
+    function save() {
+      var n = 0;
+      if (!aucunRetard) {
+        n = nbRetards;
+        if (n > maxN) { LM.toast("Le nombre de retards ne peut pas dépasser le nombre de livraisons de cette entrée (" + maxN + ").", "danger"); return; }
+        var badHeure = selectedClients.filter(function (sc) { return sc.heureDebut && sc.heureFin && sc.heureFin <= sc.heureDebut; })[0];
+        if (badHeure) {
+          activeId = badHeure.clientId; creating = null; renderCards(); renderRight();
+          LM.toast("L'heure de fin de commande doit être postérieure à l'heure de début (" + (DB.clientNom(badHeure.clientId) || "client") + ").", "danger");
+          return;
+        }
+      }
+      var patch = {
+        nbLivraisonsRetard: n,
+        aucunRetard: aucunRetard,
+        clients: aucunRetard ? [] : selectedClients.map(function (sc) {
+          return { clientId: sc.clientId, tempsRetard: sc.tempsRetard, heureDebut: sc.heureDebut || "", heureFin: sc.heureFin || "", justifications: (sc.justifications || []).slice() };
+        }),
+        commentaire: (commentaire || "").toString().trim()
+      };
+      DB.upsertRetard(livraisonRow.id, patch);
+      DB.logHistorique("Retards", existing ? "modification" : "ajout", (existing ? "Modification" : "Ajout") + " signalement de retard : livraison du " + DB.fmtDate(livraisonRow.date) + " (" + (livraisonRow.livreurNom || "livreur inconnu") + ") -> " + (aucunRetard ? "aucun retard" : (n + " en retard")));
+      LM.toast("Retard enregistré.", "success");
+      LM.closeModal();
+      if (typeof onSaved === "function") onSaved();
+    }
   }
 
   function kpiR(iconName, label, value) {
