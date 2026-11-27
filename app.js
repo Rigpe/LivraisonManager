@@ -6586,6 +6586,7 @@
         '</div>' +
       '</div>' +
       '<div class="grid grid-4" id="kpiRow" style="margin-bottom:22px;"></div>' +
+      '<div class="grid grid-4" id="kpiRow2" style="margin-bottom:22px;display:none;"></div>' +
       '<div id="punctRow"></div>' +
       '<div class="grid grid-2">' +
         '<div class="card"><h3>Livraisons par jour</h3><p class="text-sm">Évolution sur la période sélectionnée.</p><div id="chartLine" style="margin-top:10px;"></div></div>' +
@@ -6595,6 +6596,7 @@
         '<div class="card"><h3>Répartition des livraisons par entrepôt</h3><p class="text-sm">Part de chaque site sur la période.</p><div id="chartDonut" style="margin-top:10px;"></div></div>' +
         '<div class="card"><h3>Top livreurs</h3><p class="text-sm">Classement par nombre de livraisons.</p><div id="chartBarLiv" style="margin-top:10px;"></div></div>' +
       '</div>' +
+      '<div id="punctCharts"></div>' +
       '<div class="card" id="rankingsCard"></div>' +
       '<div class="card" id="controlCard"></div>' +
       '<div class="card" id="journalCard">' +
@@ -6706,26 +6708,224 @@
       kpi("box", "Bacs livrés", DB.fmtNum(nbBacs), trendHtml(nbBacs, prevBacs)) +
       kpi("zones", "Kilomètres parcourus", DB.fmtNum(Math.round(km)), trendHtml(km, prevKm)) +
       kpi("alert", "Incidents signalés", DB.fmtNum(incidents), trendHtml(incidents, prevIncidents));
+    renderPunctKpis(rows, prevRows);
     renderPunctuality(rows);
   }
 
-  // Bandeau « Ponctualité » sous les KPI : répartition en avance / à l'heure / en retard des commandes
-  // dont la ponctualité a été renseignée (saisie manuelle ou fiche d'entrée). Masqué sans donnée.
+  // ------------------------------------------------------------------
+  // Ponctualité : cadres de statistiques et graphiques (en avance / à l'heure / en retard)
+  // ------------------------------------------------------------------
+  function cssColor(name, fb) {
+    try { var v = getComputedStyle(document.documentElement).getPropertyValue(name).trim(); return v || fb; } catch (e) { return fb; }
+  }
+  function punctColors() {
+    return { early: cssColor("--color-info", "#2f7dd1"), ontime: cssColor("--color-success", "#1f9d61"), late: cssColor("--color-danger", "#d64545") };
+  }
+  function fmtPct(n) { return (Math.round(n * 10) / 10).toLocaleString("fr-FR") + " %"; }
+
+  // Commandes dont la ponctualité est renseignée (saisie manuelle ou fiche d'entrée) : en avance,
+  // à l'heure et en retard (retards signalés). Les entrées sans classement sont ignorées.
+  function punctStats(rows) {
+    var pr = rows.filter(function (r) { return r.nbEnAvance != null || r.nbALHeure != null; });
+    var avance = sumField(pr, "nbEnAvance"), alh = sumField(pr, "nbALHeure"), ret = sumRetard(pr);
+    return { rows: pr, avance: avance, alh: alh, ret: ret, total: avance + alh + ret };
+  }
+
+  // Évolution d'une part (en %) par rapport à la période précédente, en points. inverse : une hausse est négative.
+  function ptTrendHtml(cur, prev, inverse) {
+    if (prev == null) return '<div class="kpi-trend flat">Pas de période de référence</div>';
+    var diff = Math.round((cur - prev) * 10) / 10;
+    var up = inverse ? diff < 0 : diff > 0, down = inverse ? diff > 0 : diff < 0;
+    var cls = diff === 0 ? "flat" : (up ? "up" : "down");
+    var arrow = diff > 0 ? "▲" : diff < 0 ? "▼" : "→";
+    return '<div class="kpi-trend ' + cls + '">' + arrow + ' ' + (diff > 0 ? "+" : "") + diff.toLocaleString("fr-FR") + ' pt vs période précédente</div>';
+  }
+
+  function renderPunctKpis(rows, prevRows) {
+    var host = document.getElementById("kpiRow2");
+    if (!host) return;
+    var s = punctStats(rows);
+    if (!s.total) { host.innerHTML = ""; host.style.display = "none"; return; }
+    host.style.display = "";
+    var p = punctStats(prevRows);
+    var share = function (n, t) { return t ? n / t * 100 : null; };
+    var val = function (n) { return DB.fmtNum(n) + ' <span class="kpi-sub">(' + fmtPct(n / s.total * 100) + ')</span>'; };
+    var ponct = (s.avance + s.alh) / s.total * 100;
+    host.innerHTML =
+      kpi("trend", "Livrées en avance", val(s.avance), ptTrendHtml(s.avance / s.total * 100, share(p.avance, p.total), false)) +
+      kpi("clock", "Livrées à l'heure", val(s.alh), ptTrendHtml(s.alh / s.total * 100, share(p.alh, p.total), false)) +
+      kpi("retard", "Livrées en retard", val(s.ret), ptTrendHtml(s.ret / s.total * 100, share(p.ret, p.total), true)) +
+      kpi("check", "Taux de ponctualité", fmtPct(ponct), ptTrendHtml(ponct, p.total ? (p.avance + p.alh) / p.total * 100 : null, false));
+  }
+
+  // Bandeau « Ponctualité » : répartition en avance / à l'heure / en retard (masqué sans donnée).
   function renderPunctuality(rows) {
     var host = document.getElementById("punctRow");
     if (!host) return;
-    var pr = rows.filter(function (r) { return r.nbEnAvance != null || r.nbALHeure != null; });
-    var avance = sumField(pr, "nbEnAvance"), alh = sumField(pr, "nbALHeure"), ret = sumRetard(pr);
-    var total = avance + alh + ret;
-    if (!total) { host.innerHTML = ""; return; }
-    var pct = function (n) { return Math.round(n / total * 1000) / 10; };
+    var s = punctStats(rows);
+    if (!s.total) { host.innerHTML = ""; return; }
     var seg = function (cls, n) { return n ? '<span class="punct-seg ' + cls + '" style="flex:' + n + ';" title="' + n + '"></span>' : ""; };
-    var leg = function (cls, label, n) { return '<span class="punct-leg"><span class="punct-dot ' + cls + '"></span>' + label + ' <strong>' + DB.fmtNum(n) + '</strong> <span class="text-faint">(' + pct(n).toLocaleString("fr-FR") + ' %)</span></span>'; };
     host.innerHTML = '<div class="card punct-card">' +
-      '<div class="punct-head"><h3>Ponctualité des commandes</h3><span class="text-sm text-faint">sur ' + DB.fmtNum(total) + ' commande' + (total > 1 ? 's' : '') + ' classée' + (total > 1 ? 's' : '') + ' (' + pr.length + ' entrée' + (pr.length > 1 ? 's' : '') + ')</span></div>' +
-      '<div class="punct-bar">' + seg("punct-early", avance) + seg("punct-ontime", alh) + seg("punct-late", ret) + '</div>' +
-      '<div class="punct-legend">' + leg("punct-early", "En avance", avance) + leg("punct-ontime", "À l\'heure", alh) + leg("punct-late", "En retard", ret) + '</div>' +
+      '<div class="punct-head"><h3>Ponctualité des commandes</h3><span class="text-sm text-faint">sur ' + DB.fmtNum(s.total) + ' commande' + (s.total > 1 ? 's' : '') + ' classée' + (s.total > 1 ? 's' : '') + ' (' + s.rows.length + ' entrée' + (s.rows.length > 1 ? 's' : '') + ')</span></div>' +
+      '<div class="punct-bar">' + seg("punct-early", s.avance) + seg("punct-ontime", s.alh) + seg("punct-late", s.ret) + '</div>' +
+      '<div class="punct-legend"><span class="punct-leg"><span class="punct-dot punct-early"></span>En avance</span><span class="punct-leg"><span class="punct-dot punct-ontime"></span>À l\'heure</span><span class="punct-leg"><span class="punct-dot punct-late"></span>En retard</span></div>' +
     '</div>';
+  }
+
+  // Lignes « barre segmentée 100 % » (avance / heure / retard) pour un classement par entrepôt ou livreur.
+  function punctStackRows(list) {
+    var seg = function (cls, n, label) { return n ? '<span class="punct-seg ' + cls + '" style="flex:' + n + ';" title="' + label + ' : ' + n + '"></span>' : ""; };
+    return list.map(function (g) {
+      var t = g.avance + g.alh + g.ret;
+      var tauxRet = t ? g.ret / t * 100 : 0;
+      var cls = tauxRet >= 5 ? "badge-danger" : (tauxRet >= 2 ? "badge-warning" : "badge-success");
+      return '<div class="pc-row"><span class="pc-label" title="' + LM.escapeHtml(g.label) + '">' + LM.escapeHtml(g.label) + '</span>' +
+        '<div class="punct-bar pc-bar">' + seg("punct-early", g.avance, "En avance") + seg("punct-ontime", g.alh, "À l'heure") + seg("punct-late", g.ret, "En retard") + '</div>' +
+        '<span class="badge ' + cls + ' pc-badge" title="Part de commandes en retard">' + fmtPct(tauxRet) + ' retard</span>' +
+        '<span class="pc-n text-faint">' + DB.fmtNum(t) + '</span></div>';
+    }).join("");
+  }
+
+  function renderPunctCharts(rows) {
+    var host = document.getElementById("punctCharts");
+    if (!host) return;
+    var s = punctStats(rows);
+
+    // Détail des retards signalés (page Retards) : une ligne par client en retard.
+    var details = [];
+    rows.forEach(function (r) {
+      var ret = DB.retardPourLivraison(r.id);
+      if (!ret || ret.aucunRetard) return;
+      (ret.clients || []).forEach(function (c) { details.push({ row: r, clientId: c.clientId, temps: (c.tempsRetard != null && isFinite(Number(c.tempsRetard))) ? Number(c.tempsRetard) : null, justifs: Array.isArray(c.justifications) ? c.justifications : [] }); });
+    });
+
+    if (!s.total && !details.length) {
+      host.innerHTML = '<div class="card punct-card"><h3>Ponctualité &amp; retards</h3><p class="text-sm text-faint" style="margin:0;">Renseignez « En avance » et « À l\'heure » dans la saisie manuelle, et gérez les retards depuis la page Retards, pour voir ici les graphiques de ponctualité.</p></div>';
+      return;
+    }
+    var C = punctColors();
+    var html = '<div class="card-header" style="margin:4px 0 12px;"><div><h2 style="margin:0;">Ponctualité &amp; retards</h2><p class="text-sm" style="margin:2px 0 0;">Basé sur les commandes classées (en avance / à l\'heure) et sur les retards signalés de la période.</p></div></div>';
+
+    if (s.total) {
+      html += '<div class="grid grid-2">' +
+        '<div class="card"><h3>Ponctualité par jour</h3><p class="text-sm">Commandes en avance, à l\'heure et en retard.</p><div id="chartPunctDay" style="margin-top:10px;"></div></div>' +
+        '<div class="card"><h3>Répartition de la ponctualité</h3><p class="text-sm">Part de chaque catégorie sur la période.</p><div id="chartPunctDonut" style="margin-top:10px;"></div></div>' +
+      '</div>';
+      var byEnt = {}, byLiv = {};
+      s.rows.forEach(function (r) {
+        var ret = sumRetard([r]);
+        var add = function (map, k, label) {
+          var g = map[k] = map[k] || { label: label, avance: 0, alh: 0, ret: 0 };
+          g.avance += Number(r.nbEnAvance) || 0; g.alh += Number(r.nbALHeure) || 0; g.ret += ret;
+        };
+        add(byEnt, entrepotKey(r), entrepotLabel(r));
+        add(byLiv, livreurKey(r), livreurLabel(r));
+      });
+      var tot = function (g) { return g.avance + g.alh + g.ret; };
+      var rate = function (g) { return tot(g) ? g.ret / tot(g) : 0; };
+      var entList = Object.keys(byEnt).map(function (k) { return byEnt[k]; }).filter(function (g) { return tot(g) > 0; }).sort(function (a, b) { return (rate(b) - rate(a)) || (tot(b) - tot(a)); });
+      var livAll = Object.keys(byLiv).map(function (k) { return byLiv[k]; }).filter(function (g) { return tot(g) > 0; });
+      var livBig = livAll.filter(function (g) { return tot(g) >= 10; });
+      var livList = (livBig.length ? livBig : livAll).sort(function (a, b) { return (rate(b) - rate(a)) || (tot(b) - tot(a)); }).slice(0, 8);
+      html += '<div class="grid grid-2">' +
+        '<div class="card"><h3>Ponctualité par entrepôt</h3><p class="text-sm">Du plus au moins en retard · nombre de commandes classées à droite.</p><div class="pc-list" style="margin-top:10px;">' + punctStackRows(entList) + '</div></div>' +
+        '<div class="card"><h3>Ponctualité par livreur</h3><p class="text-sm">' + (livBig.length ? "Livreurs avec au moins 10 commandes classées, du plus au moins en retard." : "Du plus au moins en retard (peu de commandes classées).") + '</p><div class="pc-list" style="margin-top:10px;">' + punctStackRows(livList) + '</div></div>' +
+      '</div>';
+    }
+
+    if (details.length) {
+      html += '<div class="card-header" style="margin:4px 0 12px;"><div><h3 style="margin:0;">Analyse des retards</h3><p class="text-sm" style="margin:2px 0 0;">Temps de retard, motifs, distance des clients et jours de la semaine.</p></div></div>' +
+        '<div class="grid grid-4" id="retKpis" style="margin-bottom:22px;"></div>' +
+        '<div class="grid grid-2">' +
+          '<div class="card"><h3>Temps de retard</h3><p class="text-sm">Nombre de clients en retard par tranche de durée.</p><div id="chartRetTemps" style="margin-top:10px;"></div></div>' +
+          '<div class="card"><h3>Retards selon la distance du client</h3><p class="text-sm">Distance du client à l\'entrepôt (fiche client).</p><div id="chartRetDist" style="margin-top:10px;"></div></div>' +
+        '</div>' +
+        '<div class="grid grid-2">' +
+          '<div class="card"><h3>Retards par jour de la semaine</h3><p class="text-sm">Part de livraisons en retard (retards signalés ÷ livraisons).</p><div id="chartRetWd" style="margin-top:10px;"></div></div>' +
+          '<div class="card"><h3>Motifs de retard les plus fréquents</h3><p class="text-sm">Justificatifs saisis pour les clients en retard.</p><div id="retMotifs" style="margin-top:10px;"></div></div>' +
+        '</div>';
+    }
+    host.innerHTML = html;
+
+    if (s.total) {
+      var byDay = {};
+      s.rows.forEach(function (r) {
+        var d = byDay[r.date] = byDay[r.date] || { a: 0, h: 0, r: 0 };
+        d.a += Number(r.nbEnAvance) || 0; d.h += Number(r.nbALHeure) || 0; d.r += sumRetard([r]);
+      });
+      var days = [];
+      for (var d = new Date(period.start); d <= new Date(period.end); d.setDate(d.getDate() + 1)) days.push(d.toISOString().slice(0, 10));
+      LMCharts.lineChart(document.getElementById("chartPunctDay"), {
+        labels: days.map(function (iso) { return iso.slice(8, 10) + "/" + iso.slice(5, 7); }),
+        series: [
+          { name: "En avance", color: C.early, data: days.map(function (iso) { return byDay[iso] ? byDay[iso].a : 0; }) },
+          { name: "À l'heure", color: C.ontime, data: days.map(function (iso) { return byDay[iso] ? byDay[iso].h : 0; }) },
+          { name: "En retard", color: C.late, data: days.map(function (iso) { return byDay[iso] ? byDay[iso].r : 0; }) }
+        ],
+        area: false, height: 260
+      });
+      LMCharts.donutChart(document.getElementById("chartPunctDonut"), {
+        data: [{ label: "En avance", value: s.avance, color: C.early }, { label: "À l'heure", value: s.alh, color: C.ontime }, { label: "En retard", value: s.ret, color: C.late }],
+        height: 240
+      });
+    }
+
+    if (details.length) {
+      var withT = details.filter(function (x) { return x.temps != null; });
+      var avg = withT.length ? Math.round(withT.reduce(function (a, x) { return a + x.temps; }, 0) / withT.length) : null;
+      var mx = withT.length ? Math.max.apply(null, withT.map(function (x) { return x.temps; })) : null;
+      var perClient = {};
+      details.forEach(function (x) { perClient[x.clientId] = (perClient[x.clientId] || 0) + 1; });
+      var nbClients = Object.keys(perClient).length;
+      var nbRecid = Object.keys(perClient).filter(function (k) { return perClient[k] >= 2; }).length;
+      document.getElementById("retKpis").innerHTML =
+        kpi("clock", "Retard moyen", avg != null ? avg + " min" : "—") +
+        kpi("alert", "Retard maximum", mx != null ? mx + " min" : "—") +
+        kpi("clients", "Clients touchés", DB.fmtNum(nbClients)) +
+        kpi("retard", "Clients en retard 2 fois ou plus", DB.fmtNum(nbRecid));
+
+      var tr = [["≤ 10 min", 0, 10], ["11–20 min", 11, 20], ["21–30 min", 21, 30], ["31–60 min", 31, 60], ["> 60 min", 61, Infinity]];
+      var trCounts = tr.map(function (b) { return withT.filter(function (x) { return x.temps >= b[1] && x.temps <= b[2]; }).length; });
+      var labelsT = tr.map(function (b) { return b[0]; });
+      var nbNoT = details.length - withT.length;
+      if (nbNoT) { labelsT.push("Non renseigné"); trCounts.push(nbNoT); }
+      LMCharts.barChart(document.getElementById("chartRetTemps"), { labels: labelsT, series: [{ name: "Clients en retard", color: C.late, data: trCounts }], height: 240 });
+
+      var dist = [["< 5 km", 0, 5], ["5–10 km", 5, 10], ["10–20 km", 10, 20], ["≥ 20 km", 20, Infinity]];
+      var dCounts = dist.map(function () { return 0; }), dUnknown = 0;
+      details.forEach(function (x) {
+        var c = DB.get("clients", x.clientId);
+        var km = c && c.distanceKm !== "" && c.distanceKm != null ? Number(c.distanceKm) : NaN;
+        if (!isFinite(km)) { dUnknown++; return; }
+        for (var i = 0; i < dist.length; i++) { if (km >= dist[i][1] && km < dist[i][2]) { dCounts[i]++; break; } }
+      });
+      var labelsD = dist.map(function (b) { return b[0]; });
+      if (dUnknown) { labelsD.push("Non renseignée"); dCounts.push(dUnknown); }
+      LMCharts.barChart(document.getElementById("chartRetDist"), { labels: labelsD, series: [{ name: "Clients en retard", color: C.late, data: dCounts }], height: 240 });
+
+      var JN = ["Dim", "Lun", "Mar", "Mer", "Jeu", "Ven", "Sam"];
+      var wdLiv = {}, wdRet = {};
+      rows.forEach(function (r) {
+        var k = new Date(r.date + "T12:00:00").getDay();
+        wdLiv[k] = (wdLiv[k] || 0) + (Number(r.nbLivraisons) || 0);
+        wdRet[k] = (wdRet[k] || 0) + sumRetard([r]);
+      });
+      var order = [1, 2, 3, 4, 5, 6, 0].filter(function (k) { return wdLiv[k]; });
+      LMCharts.barChart(document.getElementById("chartRetWd"), {
+        labels: order.map(function (k) { return JN[k]; }),
+        series: [{ name: "Taux de retard", color: C.late, data: order.map(function (k) { return Math.round((wdRet[k] || 0) / wdLiv[k] * 1000) / 10; }) }],
+        yFormat: function (v) { return (Math.round(v * 100) / 100).toLocaleString("fr-FR") + " %"; },
+        height: 240
+      });
+
+      var motifs = {};
+      details.forEach(function (x) { x.justifs.forEach(function (k) { motifs[k] = (motifs[k] || 0) + 1; }); });
+      var mList = Object.keys(motifs).map(function (k) { return { label: DB.listeLabel("motifsRetard", k) || "Justificatif supprimé", n: motifs[k] }; }).sort(function (a, b) { return b.n - a.n; }).slice(0, 6);
+      var mMax = mList.length ? mList[0].n : 1;
+      document.getElementById("retMotifs").innerHTML = mList.length ? mList.map(function (m, i) {
+        return '<div class="rk-row"><span class="rk-rank">' + (i + 1) + '</span><span class="rk-label">' + LM.escapeHtml(m.label) + '</span><span class="rk-bar"><span class="rk-bar-fill" style="width:' + Math.max(2, Math.round(m.n / mMax * 100)) + '%"></span></span><strong class="rk-val">' + m.n + '</strong></div>';
+      }).join("") : '<p class="text-sm text-faint" style="margin:0;">Aucun justificatif renseigné sur cette période.</p>';
+    }
   }
 
   // ------------------------------------------------------------------
@@ -6788,6 +6988,8 @@
       series: [{ name: "Livraisons", data: livList.map(function (l) { return l.liv; }) }],
       height: 260
     });
+
+    renderPunctCharts(rows);
   }
 
   // Export Excel de la période : journal détaillé + synthèses par entrepôt et par livreur.
@@ -6800,24 +7002,27 @@
       var ret = sumRetard([r]);
       journal.push([r.date, entrepotLabel(r), livreurLabel(r), Number(r.nbLivraisons) || 0, Number(r.nbBacs) || 0, Number(r.km) || 0, r.nbEnAvance != null ? Number(r.nbEnAvance) || 0 : "", r.nbALHeure != null ? Number(r.nbALHeure) || 0 : "", ret, Number(r.incidents) || 0, r.client || "", r.adresse || "", r.codePostal || "", r.ville || "", r.tournee || "", r.sequence || "", r.source || "", r.commentaire || ""]);
       var ke = entrepotKey(r), kl = livreurKey(r);
-      var e = byEnt[ke] = byEnt[ke] || { label: entrepotLabel(r), liv: 0, bacs: 0, km: 0, ret: 0 };
-      var l = byLiv[kl] = byLiv[kl] || { label: livreurLabel(r), liv: 0, bacs: 0, km: 0, ret: 0, days: {} };
-      [e, l].forEach(function (g) { g.liv += Number(r.nbLivraisons) || 0; g.bacs += Number(r.nbBacs) || 0; g.km += Number(r.km) || 0; g.ret += ret; });
+      var e = byEnt[ke] = byEnt[ke] || { label: entrepotLabel(r), liv: 0, bacs: 0, km: 0, ret: 0, av: 0, ah: 0, retC: 0 };
+      var l = byLiv[kl] = byLiv[kl] || { label: livreurLabel(r), liv: 0, bacs: 0, km: 0, ret: 0, av: 0, ah: 0, retC: 0, days: {} };
+      [e, l].forEach(function (g) { g.liv += Number(r.nbLivraisons) || 0; g.bacs += Number(r.nbBacs) || 0; g.km += Number(r.km) || 0; g.ret += ret;
+        if (r.nbEnAvance != null || r.nbALHeure != null) { g.av += Number(r.nbEnAvance) || 0; g.ah += Number(r.nbALHeure) || 0; g.retC += ret; }
+      });
       l.days[r.date] = true;
     });
-    var sEnt = [["Entrepôt", "Livraisons", "Bacs", "Km", "Retards signalés", "Taux de retard (%)"]];
+    var ponctPct = function (g) { var t = g.av + g.ah + g.retC; return t ? Math.round((g.av + g.ah) / t * 1000) / 10 : ""; };
+    var sEnt = [["Entrepôt", "Livraisons", "Bacs", "Km", "Retards signalés", "Taux de retard (%)", "En avance", "À l'heure", "Ponctualité (%)"]];
     Object.keys(byEnt).map(function (k) { return byEnt[k]; }).sort(function (a, b) { return b.liv - a.liv; }).forEach(function (g) {
-      sEnt.push([g.label, g.liv, g.bacs, Math.round(g.km * 10) / 10, g.ret, g.liv ? Math.round(g.ret / g.liv * 1000) / 10 : 0]);
+      sEnt.push([g.label, g.liv, g.bacs, Math.round(g.km * 10) / 10, g.ret, g.liv ? Math.round(g.ret / g.liv * 1000) / 10 : 0, g.av, g.ah, ponctPct(g)]);
     });
-    var sLiv = [["Livreur", "Jours travaillés", "Livraisons", "Bacs", "Km", "Retards signalés", "Bacs / jour"]];
+    var sLiv = [["Livreur", "Jours travaillés", "Livraisons", "Bacs", "Km", "Retards signalés", "Bacs / jour", "En avance", "À l'heure", "Ponctualité (%)"]];
     Object.keys(byLiv).map(function (k) { return byLiv[k]; }).sort(function (a, b) { return b.liv - a.liv; }).forEach(function (g) {
       var nj = Object.keys(g.days).length;
-      sLiv.push([g.label, nj, g.liv, g.bacs, Math.round(g.km * 10) / 10, g.ret, nj ? Math.round(g.bacs / nj * 10) / 10 : 0]);
+      sLiv.push([g.label, nj, g.liv, g.bacs, Math.round(g.km * 10) / 10, g.ret, nj ? Math.round(g.bacs / nj * 10) / 10 : 0, g.av, g.ah, ponctPct(g)]);
     });
     XLSXLite.downloadWorkbook("livraisons_" + period.start + "_" + period.end + ".xlsx", [
       { name: "Journal", rows: journal, widths: [12, 22, 22, 11, 8, 8, 14, 10, 24, 30, 11, 16, 12, 10, 10, 30] },
-      { name: "Par entrepôt", rows: sEnt, widths: [26, 12, 10, 10, 16, 18] },
-      { name: "Par livreur", rows: sLiv, widths: [26, 16, 12, 10, 10, 16, 12] }
+      { name: "Par entrepôt", rows: sEnt, widths: [26, 12, 10, 10, 16, 18, 12, 12, 16] },
+      { name: "Par livreur", rows: sLiv, widths: [26, 16, 12, 10, 10, 16, 12, 12, 12, 16] }
     ]);
     LM.toast("Export Excel téléchargé (" + rows.length + " ligne(s)).", "success");
   }
