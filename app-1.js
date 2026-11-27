@@ -1,6 +1,6 @@
 /* ==== js/db.js ==== */
 /*!
- * db.js - Couche de données partagée (localStorage) pour LivraisonManager.
+ * db.js - Couche de données partagée (IndexedDB, repli localStorage) pour LivraisonManager.
  * Aucune dépendance externe. Toutes les pages incluent ce fichier avant leur script propre.
  */
 (function (global) {
@@ -167,6 +167,15 @@
       droitRTTDefaut: 0
     }
   };
+
+  var _migratedFlag = false;
+  function prepareParsed(parsed) {
+    Object.keys(DEFAULT_DATA).forEach(function (k) {
+      if (parsed[k] === undefined) parsed[k] = JSON.parse(JSON.stringify(DEFAULT_DATA[k]));
+    });
+    _migratedFlag = !!migrateData(parsed);
+    return parsed;
+  }
 
   function load() {
     var raw;
@@ -343,14 +352,132 @@
   var saveListeners = [];
   function onSave(fn) { saveListeners.push(fn); }
 
+  // -----------------------------------------------------------------------
+  // Persistance : IndexedDB (plusieurs centaines de Mo) avec repli sur localStorage (≈ 5 Mo)
+  //
+  // localStorage plafonne à environ 5 Mo par site : une fois le planning, le journal des
+  // livraisons et l'historique volumineux, l'enregistrement échouait (« espace de stockage local
+  // insuffisant »). Les données sont donc conservées en mémoire (_cache, accès synchrone comme
+  // avant) et écrites dans IndexedDB en arrière-plan, par lots (quelques dizaines de ms après la
+  // dernière modification) et immédiatement quand la page se ferme ou passe en arrière-plan.
+  // Au premier lancement, les données existantes de localStorage sont migrées automatiquement.
+  // Si IndexedDB est indisponible (navigation privée, navigateur ancien…), l'ancien mode
+  // localStorage reste utilisé.
+  // -----------------------------------------------------------------------
+  var IDB_NAME = "livraisonmanager";
+  var IDB_STORE = "kv";
+  var _idb = null;
+  var _dirty = false, _writing = false, _flushTimer = null;
+  var _initDone = false;
+  var saveErrorListeners = [];
+  function onSaveError(fn) { saveErrorListeners.push(fn); }
+  function notifySaveError(e) { console.error("Écriture IndexedDB impossible :", e); saveErrorListeners.forEach(function (fn) { try { fn(e); } catch (e2) { console.error(e2); } }); }
+
+  function idbOpen(cb) {
+    var done = false;
+    function end(err, db) { if (done) return; done = true; cb(err, db); }
+    try {
+      if (typeof indexedDB === "undefined" || !indexedDB) { end(new Error("IndexedDB indisponible")); return; }
+      var req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = function () { try { req.result.createObjectStore(IDB_STORE); } catch (e) { /* existe déjà */ } };
+      req.onsuccess = function () { end(null, req.result); };
+      req.onerror = function () { end(req.error || new Error("Ouverture IndexedDB impossible")); };
+      req.onblocked = function () { end(new Error("IndexedDB bloquée")); };
+      setTimeout(function () { end(new Error("IndexedDB : délai dépassé")); }, 4000);
+    } catch (e) { end(e); }
+  }
+  function idbGet(db, cb) {
+    try {
+      var tx = db.transaction(IDB_STORE, "readonly");
+      var rq = tx.objectStore(IDB_STORE).get(STORAGE_KEY);
+      rq.onsuccess = function () { cb(null, rq.result); };
+      rq.onerror = function () { cb(rq.error || new Error("Lecture IndexedDB impossible")); };
+    } catch (e) { cb(e); }
+  }
+  function idbPut(db, value, cb) {
+    try {
+      var tx = db.transaction(IDB_STORE, "readwrite");
+      tx.objectStore(IDB_STORE).put(value, STORAGE_KEY);
+      tx.oncomplete = function () { cb(null); };
+      tx.onerror = function () { cb(tx.error || new Error("Écriture IndexedDB impossible")); };
+      tx.onabort = function () { cb(tx.error || new Error("Écriture IndexedDB annulée")); };
+    } catch (e) { cb(e); }
+  }
+
+  // Charge les données (IndexedDB, avec migration depuis localStorage) AVANT le premier affichage.
+  function init(cb) {
+    if (_initDone) { cb(); return; }
+    function finish() {
+      _initDone = true;
+      try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) { /* facultatif */ }
+      global.addEventListener("pagehide", flushNow);
+      global.addEventListener("beforeunload", flushNow);
+      document.addEventListener("visibilitychange", function () { if (document.visibilityState === "hidden") flushNow(); });
+      cb();
+    }
+    idbOpen(function (err, db) {
+      if (err || !db) { console.warn("IndexedDB indisponible, repli sur localStorage :", err); finish(); return; }
+      idbGet(db, function (err2, val) {
+        if (err2) { console.warn("Lecture IndexedDB impossible, repli sur localStorage :", err2); finish(); return; }
+        if (val && typeof val === "object") {
+          _cache = prepareParsed(val);
+          _idb = db;
+          if (_migratedFlag) { _dirty = true; scheduleFlush(); }
+          finish();
+          return;
+        }
+        // Base IndexedDB vide : migration éventuelle des données localStorage existantes.
+        var raw = null;
+        try { raw = localStorage.getItem(STORAGE_KEY); } catch (e) { raw = null; }
+        if (!raw) { _idb = db; finish(); return; }
+        var parsed;
+        try { parsed = prepareParsed(JSON.parse(raw)); } catch (e) { console.error("Données localStorage illisibles, migration abandonnée.", e); _idb = db; finish(); return; }
+        idbPut(db, parsed, function (err3) {
+          if (err3) { console.warn("Migration vers IndexedDB impossible, repli sur localStorage :", err3); finish(); return; }
+          _cache = parsed;
+          _idb = db;
+          // Copie vérifiée : on libère l'espace localStorage.
+          try { localStorage.removeItem(STORAGE_KEY); } catch (e) { /* silencieux */ }
+          finish();
+        });
+      });
+    });
+  }
+
+  function scheduleFlush() {
+    if (_flushTimer) return;
+    _flushTimer = setTimeout(function () { _flushTimer = null; flushNow(); }, 60);
+  }
+
+  function flushNow() {
+    if (_flushTimer) { clearTimeout(_flushTimer); _flushTimer = null; }
+    if (!_idb || !_dirty) return;
+    if (_writing) return; // l'écriture en cours relancera un vidage à sa fin
+    _dirty = false;
+    _writing = true;
+    idbPut(_idb, _cache, function (err) {
+      _writing = false;
+      if (err) { _dirty = true; notifySaveError(err); return; }
+      if (_dirty) scheduleFlush();
+    });
+  }
+
+  function notifySaved() { saveListeners.forEach(function (fn) { try { fn(); } catch (e2) { console.error(e2); } }); }
+
   function save() {
+    if (_idb) {
+      _dirty = true;
+      scheduleFlush();
+      notifySaved();
+      return true;
+    }
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(_cache));
     } catch (e) {
       console.error("Impossible de sauvegarder :", e);
       return false;
     }
-    saveListeners.forEach(function (fn) { try { fn(); } catch (e2) { console.error(e2); } });
+    notifySaved();
     return true;
   }
 
@@ -1384,7 +1511,10 @@
     getLastBackupAt: getLastBackupAt,
     onSave: onSave,
     resetAll: resetAll,
-    seedIfEmpty: seedIfEmpty
+    seedIfEmpty: seedIfEmpty,
+    init: init,
+    flushNow: flushNow,
+    onSaveError: onSaveError
   };
 })(typeof window !== "undefined" ? window : globalThis);
 
@@ -2693,6 +2823,13 @@
   function isFirstRun() { return firstRun; }
 
   function start() {
+    var lastSaveErrorToast = 0;
+    global.DB.onSaveError(function () {
+      // Limite l'affichage à un message toutes les 10 s si les écritures échouent en rafale.
+      if (Date.now() - lastSaveErrorToast < 10000) return;
+      lastSaveErrorToast = Date.now();
+      global.LM.toast("Enregistrement impossible : le navigateur refuse d'écrire les données. Utilisez « Sauvegarder » (menu de gauche) pour exporter une copie, puis libérez de l'espace disque.", "danger");
+    });
     firstRun = global.DB.seedIfEmpty();
     router();
     global.addEventListener("hashchange", router);
@@ -2722,7 +2859,7 @@
     refresh: router
   };
 
-  document.addEventListener("DOMContentLoaded", start);
+  document.addEventListener("DOMContentLoaded", function () { global.DB.init(start); });
 })(typeof window !== "undefined" ? window : globalThis);
 
 
